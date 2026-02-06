@@ -4,11 +4,16 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import warnings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LANDMARKS_DIR = PROJECT_ROOT / "data" / "landmarks"
 LABELS_DIR = PROJECT_ROOT / "data" / "labels"
+
+# Step 3 landmarks CSVs are very wide, and pandas can emit a PerformanceWarning
+# when adding a derived column. The warning is noisy and not actionable here.
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,6 +28,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-ids", default=None)
     parser.add_argument("--max-videos", type=int, default=None)
     parser.add_argument("--max-entities", type=int, default=None)
+    parser.add_argument(
+        "--target-fps",
+        type=float,
+        default=25.0,
+        help=(
+            "Frames-per-second used to convert --window-sec/--hop-sec into "
+            "a fixed number of frames across all videos."
+        ),
+    )
     parser.add_argument("--window-sec", type=float, default=1.0)
     parser.add_argument("--hop-sec", type=float, default=0.5)
     parser.add_argument("--window-frames", type=int, default=None)
@@ -102,15 +116,15 @@ def to_bool(series: pd.Series) -> pd.Series:
     return series.astype(str).str.lower().isin(["true", "1", "yes"])
 
 
-def resolve_window_params(args: argparse.Namespace, fps: float) -> tuple[int, int]:
+def resolve_window_params(args: argparse.Namespace) -> tuple[int, int]:
     if args.window_frames is not None:
         window_frames = args.window_frames
     else:
-        window_frames = max(1, int(round(args.window_sec * fps)))
+        window_frames = max(1, int(round(args.window_sec * args.target_fps)))
     if args.hop_frames is not None:
         hop_frames = args.hop_frames
     else:
-        hop_frames = max(1, int(round(args.hop_sec * fps)))
+        hop_frames = max(1, int(round(args.hop_sec * args.target_fps)))
     return window_frames, hop_frames
 
 
@@ -190,7 +204,7 @@ def main() -> None:
             timestamps = df["timestamp"].to_numpy()
             labels = (df["label"] == "SPEAKING").astype(np.int32).to_numpy()
 
-            window_frames, hop_frames = resolve_window_params(args, fps)
+            window_frames, hop_frames = resolve_window_params(args)
             if window_frames <= 1 or hop_frames <= 0:
                 continue
 
@@ -227,6 +241,7 @@ def main() -> None:
     X = np.stack(all_windows, axis=0)
     y = np.array(all_labels, dtype=np.int64)
     meta_df = pd.DataFrame(all_meta)
+    window_frames, hop_frames = resolve_window_params(args)
 
     npz_path = output_dir / f"{args.output_name}.npz"
     meta_path = output_dir / f"{args.output_name}_meta.csv"
@@ -238,7 +253,9 @@ def main() -> None:
         json.dumps(
             {
                 "num_windows": int(X.shape[0]),
-                "window_frames": int(X.shape[1]),
+                "window_frames": int(window_frames),
+                "hop_frames": int(hop_frames),
+                "target_fps": float(args.target_fps),
                 "num_points": int(X.shape[2]),
                 "feature_type": feature_prefix,
                 "indices": feature_indices,
