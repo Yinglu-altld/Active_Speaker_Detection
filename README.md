@@ -7,6 +7,7 @@ This folder contains a step-by-step pipeline for building a Visual Voice Activit
 - Step 1: CSV ↔ video timestamp alignment (`scripts/step1_check_alignment.py`)
 - Step 2: AVA bbox → face crops (`scripts/step2_crop_face.py`)
 - Step 3: face crops → MediaPipe FaceLandmarker landmarks (`scripts/step3_extract_landmarks.py`)
+- Step 3 (batch): all videos/entities → landmarks (`scripts/step3_batch_extract_landmarks.py`)
 - Step 4: landmarks → fixed-length windows for CNN training (`scripts/step4_build_windows.py`)
 
 ## Setup
@@ -22,6 +23,20 @@ pip install -r requirements.txt
 Step 3 uses MediaPipe Tasks `FaceLandmarker` and requires a `.task` model file.
 
 - Put the model at `data/models/face_landmarker_v2.task`
+
+## Batch processing
+
+Extract landmarks for all tracks (or a subset):
+
+```bash
+./venv/bin/python scripts/step3_batch_extract_landmarks.py --max-videos 1 --max-entities 5
+```
+
+Then build training windows:
+
+```bash
+./venv/bin/python scripts/step4_build_windows.py
+```
 
 ## Notes
 

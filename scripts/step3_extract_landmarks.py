@@ -24,6 +24,12 @@ def parse_args() -> argparse.Namespace:
         default=str(PROJECT_ROOT / "data" / "models" / "face_landmarker_v2.task"),
         help="Path to a MediaPipe FaceLandmarker .task file.",
     )
+    parser.add_argument(
+        "--delegate",
+        choices=["cpu", "gpu"],
+        default="cpu",
+        help="MediaPipe delegate selection. Use cpu for headless environments.",
+    )
     parser.add_argument("--video-id", default="WwoTG3_OjUg")
     parser.add_argument("--entity-id", default=None)
     parser.add_argument("--max-frames", type=int, default=30)
@@ -205,7 +211,10 @@ def main() -> None:
     Image = image_module.Image
     ImageFormat = image_module.ImageFormat
 
-    base_options = BaseOptions(model_asset_path=str(model_path))
+    delegate = (
+        BaseOptions.Delegate.GPU if args.delegate == "gpu" else BaseOptions.Delegate.CPU
+    )
+    base_options = BaseOptions(model_asset_path=str(model_path), delegate=delegate)
     options = face_landmarker.FaceLandmarkerOptions(
         base_options=base_options,
         running_mode=RunningMode.VIDEO,
@@ -221,6 +230,7 @@ def main() -> None:
         "video_id": args.video_id,
         "entity_id": entity_id,
         "model_path": str(model_path),
+        "delegate": args.delegate,
         "fps": float(fps),
         "frame_size": {"width": frame_width, "height": frame_height},
         "stride": args.stride,
