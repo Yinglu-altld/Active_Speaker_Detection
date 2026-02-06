@@ -1,0 +1,19 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+
+# Data artifacts (large / generated)
+data/videos/
+data/labels/
+data/crops/
+data/landmarks/
+data/windows/
+data/.mplconfig/
+data/models/*.task
+
+# OS/editor
+.vscode/
