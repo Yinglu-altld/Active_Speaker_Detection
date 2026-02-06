@@ -10,6 +10,7 @@ This folder contains a step-by-step pipeline for building a Visual Voice Activit
 - Step 3 (batch): all videos/entities → landmarks (`scripts/step3_batch_extract_landmarks.py`)
 - Step 4: landmarks → fixed-length windows for CNN training (`scripts/step4_build_windows.py`)
 - Step 5: train a small CNN (`scripts/step5_train_cnn.py`)
+- Step 6: real-time inference (`scripts/step6_realtime_infer.py`)
 
 ## Setup
 
@@ -45,6 +46,20 @@ Train a model (split by video_id):
 ./venv/bin/python scripts/step5_train_cnn.py --val-video WwoTG3_OjUg
 ```
 
+Optionally evaluate on a held-out test video (excluded from training):
+
+```bash
+./venv/bin/python scripts/step5_train_cnn.py \
+  --val-video WwoTG3_OjUg --test-video Ag-pXiLrd48
+```
+
+Evaluate a held-out test video without retraining (uses saved config + best.pt):
+
+```bash
+./venv/bin/python scripts/step5_train_cnn.py \
+  --eval-only --test-video Ag-pXiLrd48
+```
+
 For clearer labels, keep only strong negatives/positives:
 
 ```bash
@@ -56,6 +71,24 @@ Disable delta features if needed:
 
 ```bash
 ./venv/bin/python scripts/step5_train_cnn.py --val-video WwoTG3_OjUg --no-delta
+```
+
+Run real-time inference (Furhat stream):
+
+```bash
+./venv/bin/python scripts/step6_realtime_infer.py --furhat-ip <FURHAT_IP> --show
+```
+
+Run real-time inference (local webcam):
+
+```bash
+./venv/bin/python scripts/step6_realtime_infer.py --source opencv --video-device 0 --show
+```
+
+Run real-time inference from a generic stream URL (MJPEG/RTSP):
+
+```bash
+./venv/bin/python scripts/step6_realtime_infer.py --source stream --stream-url <STREAM_URL> --show
 ```
 
 ## Notes

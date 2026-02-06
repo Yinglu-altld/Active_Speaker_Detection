@@ -56,6 +56,7 @@ class TrainConfig:
     npz: str
     meta_csv: str
     val_video: str
+    test_video: str | None
     min_speech_ratio: float
     max_speech_ratio: float
     filter_extremes: bool
@@ -79,7 +80,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--npz", default=str(DEFAULT_WINDOWS_NPZ))
     parser.add_argument("--meta-csv", default=str(DEFAULT_WINDOWS_META))
-    parser.add_argument("--val-video", required=True)
+    parser.add_argument("--val-video", default=None)
+    parser.add_argument(
+        "--test-video",
+        default=None,
+        help="Optional held-out video_id for final evaluation (excluded from training).",
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip training and only evaluate --test-video using an existing model.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Model checkpoint to load for --eval-only (default: <out-dir>/best.pt).",
+    )
     parser.add_argument("--min-speech-ratio", type=float, default=0.0)
     parser.add_argument("--max-speech-ratio", type=float, default=1.0)
     parser.add_argument(
@@ -156,36 +172,203 @@ def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> di
     }
 
 
+@torch.no_grad()
+def predict_probs(
+    model: nn.Module, loader: DataLoader, device: torch.device
+) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    y_true = []
+    y_prob = []
+    for x, y in loader:
+        x = x.to(device)
+        logits = model(x)
+        y_true.append(y.detach().cpu().numpy())
+        y_prob.append(torch.sigmoid(logits).detach().cpu().numpy())
+    return np.concatenate(y_true, axis=0), np.concatenate(y_prob, axis=0)
+
+
+def metrics_from_probs(
+    y_true: np.ndarray, y_prob: np.ndarray, threshold: float
+) -> dict:
+    y_pred = (y_prob >= threshold).astype(np.int32)
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    acc = (tp + tn) / max(1, (tp + tn + fp + fn))
+    prec = tp / max(1, (tp + fp))
+    rec = tp / max(1, (tp + fn))
+    f1 = (2 * prec * rec) / max(1e-9, (prec + rec))
+    return {
+        "threshold": float(threshold),
+        "acc": float(acc),
+        "precision": float(prec),
+        "recall": float(rec),
+        "f1": float(f1),
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "pos_rate": float(y_true.mean()) if y_true.size else float("nan"),
+        "pred_pos_rate": float(y_pred.mean()) if y_pred.size else float("nan"),
+    }
+
+
 def tune_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> dict:
     thresholds = np.linspace(0.05, 0.95, 19)
     best = {"threshold": 0.5, "f1": -1.0, "precision": 0.0, "recall": 0.0, "acc": 0.0}
     for t in thresholds:
-        y_pred = (y_prob >= t).astype(np.int32)
-        tp = int(((y_pred == 1) & (y_true == 1)).sum())
-        tn = int(((y_pred == 0) & (y_true == 0)).sum())
-        fp = int(((y_pred == 1) & (y_true == 0)).sum())
-        fn = int(((y_pred == 0) & (y_true == 1)).sum())
-        acc = (tp + tn) / max(1, (tp + tn + fp + fn))
-        prec = tp / max(1, (tp + fp))
-        rec = tp / max(1, (tp + fn))
-        f1 = (2 * prec * rec) / max(1e-9, (prec + rec))
-        if f1 > best["f1"]:
+        metrics = metrics_from_probs(y_true, y_prob, float(t))
+        if metrics["f1"] > best["f1"]:
             best = {
-                "threshold": float(t),
-                "f1": float(f1),
-                "precision": float(prec),
-                "recall": float(rec),
-                "acc": float(acc),
+                "threshold": metrics["threshold"],
+                "f1": metrics["f1"],
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "acc": metrics["acc"],
             }
     return best
 
 
+def load_saved_config(out_dir: Path) -> dict | None:
+    cfg_path = out_dir / "config.json"
+    if not cfg_path.exists():
+        return None
+    return json.loads(cfg_path.read_text())
+
+
+def load_threshold(out_dir: Path) -> float:
+    thresh_path = out_dir / "threshold.json"
+    if not thresh_path.exists():
+        return 0.5
+    data = json.loads(thresh_path.read_text())
+    return float(data.get("threshold", 0.5))
+
+
+def apply_filter_mask(
+    meta_all: pd.DataFrame,
+    min_speech_ratio: float,
+    max_speech_ratio: float,
+    filter_extremes: bool,
+    neg_max: float,
+    pos_min: float,
+) -> np.ndarray:
+    mask = np.ones(len(meta_all), dtype=bool)
+    if "speech_ratio" in meta_all.columns:
+        if filter_extremes:
+            mask &= (meta_all["speech_ratio"] <= neg_max) | (
+                meta_all["speech_ratio"] >= pos_min
+            )
+        else:
+            mask &= (meta_all["speech_ratio"] >= min_speech_ratio) & (
+                meta_all["speech_ratio"] <= max_speech_ratio
+            )
+    return mask
+
+
+def run_eval_only(args: argparse.Namespace) -> None:
+    if not args.test_video:
+        raise ValueError("--eval-only requires --test-video.")
+
+    out_dir = Path(args.out_dir)
+    saved_cfg = load_saved_config(out_dir)
+    if saved_cfg is None:
+        raise FileNotFoundError(
+            f"Missing config.json in {out_dir}. Train once before --eval-only."
+        )
+
+    use_delta = bool(saved_cfg.get("use_delta", True))
+    min_speech_ratio = float(saved_cfg.get("min_speech_ratio", 0.0))
+    max_speech_ratio = float(saved_cfg.get("max_speech_ratio", 1.0))
+    filter_extremes = bool(saved_cfg.get("filter_extremes", False))
+    neg_max = float(saved_cfg.get("neg_max", 0.1))
+    pos_min = float(saved_cfg.get("pos_min", 0.6))
+    batch_size = int(saved_cfg.get("batch_size", args.batch_size))
+    saved_val = saved_cfg.get("val_video")
+    if saved_val and saved_val == args.test_video:
+        print(
+            f"Warning: test_video matches the saved val_video ({saved_val}). "
+            "This is not a clean test split."
+        )
+
+    data = np.load(args.npz)
+    X = data["X"]
+    y = data["y"]
+    meta_all = pd.read_csv(args.meta_csv)
+    if len(meta_all) != len(y):
+        raise ValueError(
+            f"Meta rows ({len(meta_all)}) must match y length ({len(y)})."
+        )
+
+    mask = apply_filter_mask(
+        meta_all, min_speech_ratio, max_speech_ratio, filter_extremes, neg_max, pos_min
+    )
+    meta = meta_all[mask].reset_index(drop=True)
+    X = X[mask]
+    y = y[mask]
+
+    test_mask = meta["video_id"].astype(str) == args.test_video
+    if not bool(test_mask.any()):
+        raise ValueError(
+            f"--test-video {args.test_video!r} not found in windows_meta.csv"
+        )
+
+    X_test = X[test_mask.to_numpy()]
+    y_test = y[test_mask.to_numpy()]
+    if X_test.size == 0:
+        raise ValueError("Test split is empty after speech_ratio filtering.")
+
+    if use_delta:
+        delta = np.zeros_like(X_test)
+        delta[:, 1:, :, :] = X_test[:, 1:, :, :] - X_test[:, :-1, :, :]
+        X_test = np.concatenate([X_test, delta], axis=3)
+        num_channels = 4
+    else:
+        num_channels = 2
+
+    num_points = int(X_test.shape[2])
+    device = torch.device(args.device)
+    model = TemporalCNN(num_points=num_points, num_channels=num_channels).to(device)
+
+    checkpoint = Path(args.checkpoint) if args.checkpoint else (out_dir / "best.pt")
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
+
+    test_loader = DataLoader(
+        WindowDataset(X_test, y_test),
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    threshold = load_threshold(out_dir)
+    y_true_test, y_prob_test = predict_probs(model, test_loader, device)
+    test_metrics = metrics_from_probs(y_true_test, y_prob_test, threshold)
+    test_metrics["video_id"] = args.test_video
+    test_metrics["checkpoint"] = str(checkpoint)
+    (out_dir / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2))
+    print(
+        f"test_video={args.test_video} "
+        f"test_f1={test_metrics['f1']:.3f} "
+        f"test_acc={test_metrics['acc']:.3f} "
+        f"test_pos_rate={test_metrics['pos_rate']:.3f}"
+    )
+
+
 def main() -> None:
     args = parse_args()
+    if args.eval_only:
+        run_eval_only(args)
+        return
+
+    if not args.val_video:
+        raise ValueError("--val-video is required unless --eval-only is set.")
     cfg = TrainConfig(
         npz=args.npz,
         meta_csv=args.meta_csv,
         val_video=args.val_video,
+        test_video=args.test_video,
         min_speech_ratio=args.min_speech_ratio,
         max_speech_ratio=args.max_speech_ratio,
         filter_extremes=args.filter_extremes,
@@ -213,19 +396,20 @@ def main() -> None:
             f"Meta rows ({len(meta_all)}) must match y length ({len(y)})."
         )
 
-    mask = np.ones(len(meta_all), dtype=bool)
-    if "speech_ratio" in meta_all.columns:
-        if cfg.filter_extremes:
-            mask &= (meta_all["speech_ratio"] <= cfg.neg_max) | (
-                meta_all["speech_ratio"] >= cfg.pos_min
-            )
-        else:
-            mask &= (meta_all["speech_ratio"] >= cfg.min_speech_ratio) & (
-                meta_all["speech_ratio"] <= cfg.max_speech_ratio
-            )
+    mask = apply_filter_mask(
+        meta_all,
+        cfg.min_speech_ratio,
+        cfg.max_speech_ratio,
+        cfg.filter_extremes,
+        cfg.neg_max,
+        cfg.pos_min,
+    )
     meta = meta_all[mask].reset_index(drop=True)
     X = X[mask]
     y = y[mask]
+
+    if cfg.test_video and cfg.test_video == cfg.val_video:
+        raise ValueError("--test-video must be different from --val-video.")
 
     val_mask = meta["video_id"].astype(str) == cfg.val_video
     if not bool(val_mask.any()):
@@ -233,13 +417,27 @@ def main() -> None:
             f"--val-video {cfg.val_video!r} not found in windows_meta.csv"
         )
 
-    train_idx = np.where(~val_mask.to_numpy())[0]
-    val_idx = np.where(val_mask.to_numpy())[0]
+    test_mask = np.zeros(len(meta), dtype=bool)
+    if cfg.test_video:
+        test_mask = (meta["video_id"].astype(str) == cfg.test_video).to_numpy()
+        if not bool(test_mask.any()):
+            raise ValueError(
+                f"--test-video {cfg.test_video!r} not found in windows_meta.csv"
+            )
+
+    val_mask_np = val_mask.to_numpy()
+    train_mask = ~(val_mask_np | test_mask)
+    train_idx = np.where(train_mask)[0]
+    val_idx = np.where(val_mask_np)[0]
+    test_idx = np.where(test_mask)[0] if cfg.test_video else None
 
     X_train, y_train = X[train_idx], y[train_idx]
     X_val, y_val = X[val_idx], y[val_idx]
+    X_test, y_test = (X[test_idx], y[test_idx]) if test_idx is not None else (None, None)
     if X_train.size == 0 or X_val.size == 0:
         raise ValueError("Train/val split is empty after speech_ratio filtering.")
+    if cfg.test_video and (X_test is None or X_test.size == 0):
+        raise ValueError("Test split is empty after speech_ratio filtering.")
 
     if cfg.use_delta:
         def append_delta(arr: np.ndarray) -> np.ndarray:
@@ -249,6 +447,8 @@ def main() -> None:
 
         X_train = append_delta(X_train)
         X_val = append_delta(X_val)
+        if X_test is not None:
+            X_test = append_delta(X_test)
         num_channels = 4
     else:
         num_channels = 2
@@ -278,6 +478,14 @@ def main() -> None:
         shuffle=False,
         drop_last=False,
     )
+    test_loader = None
+    if X_test is not None:
+        test_loader = DataLoader(
+            WindowDataset(X_test, y_test),
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -317,19 +525,12 @@ def main() -> None:
             f"val_pos_rate={val_metrics['pos_rate']:.3f}"
         )
 
-    # Threshold tuning on validation set (post-training)
-    model.eval()
-    y_true = []
-    y_prob = []
-    with torch.no_grad():
-        for xb, yb in val_loader:
-            xb = xb.to(device)
-            logits = model(xb)
-            y_true.append(yb.numpy())
-            y_prob.append(torch.sigmoid(logits).cpu().numpy())
-    y_true = np.concatenate(y_true, axis=0)
-    y_prob = np.concatenate(y_prob, axis=0)
-    best_thresh = tune_threshold(y_true, y_prob)
+    # Threshold tuning on validation set (post-training, using best model)
+    best_path = out_dir / "best.pt"
+    if best_path.exists():
+        model.load_state_dict(torch.load(best_path, map_location=device))
+    y_true_val, y_prob_val = predict_probs(model, val_loader, device)
+    best_thresh = tune_threshold(y_true_val, y_prob_val)
 
     torch.save(model.state_dict(), out_dir / "last.pt")
     pd.DataFrame(history).to_csv(out_dir / "history.csv", index=False)
@@ -341,6 +542,20 @@ def main() -> None:
         f"best_threshold={best_thresh['threshold']:.2f} "
         f"best_f1={best_thresh['f1']:.3f}"
     )
+
+    if test_loader is not None:
+        y_true_test, y_prob_test = predict_probs(model, test_loader, device)
+        test_metrics = metrics_from_probs(
+            y_true_test, y_prob_test, best_thresh["threshold"]
+        )
+        test_metrics["video_id"] = cfg.test_video
+        (out_dir / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2))
+        print(
+            f"test_video={cfg.test_video} "
+            f"test_f1={test_metrics['f1']:.3f} "
+            f"test_acc={test_metrics['acc']:.3f} "
+            f"test_pos_rate={test_metrics['pos_rate']:.3f}"
+        )
 
 
 if __name__ == "__main__":
