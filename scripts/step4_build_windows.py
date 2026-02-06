@@ -116,6 +116,15 @@ def to_bool(series: pd.Series) -> pd.Series:
     return series.astype(str).str.lower().isin(["true", "1", "yes"])
 
 
+def speaking_targets(label_series: pd.Series) -> np.ndarray:
+    # AVA Active Speaker labels are typically:
+    # - NOT_SPEAKING
+    # - SPEAKING_AUDIBLE
+    # - SPEAKING_NOT_AUDIBLE
+    s = label_series.astype(str)
+    return s.str.startswith("SPEAKING").to_numpy(dtype=np.int32)
+
+
 def resolve_window_params(args: argparse.Namespace) -> tuple[int, int]:
     if args.window_frames is not None:
         window_frames = args.window_frames
@@ -202,7 +211,7 @@ def main() -> None:
             feature_tensor = build_feature_tensor(df, indices, prefix)
             frame_idx = df["frame_idx"].to_numpy()
             timestamps = df["timestamp"].to_numpy()
-            labels = (df["label"] == "SPEAKING").astype(np.int32).to_numpy()
+            labels = speaking_targets(df["label"])
 
             window_frames, hop_frames = resolve_window_params(args)
             if window_frames <= 1 or hop_frames <= 0:
