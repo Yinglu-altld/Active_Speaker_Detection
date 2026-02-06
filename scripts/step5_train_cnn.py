@@ -74,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--npz", default=str(DEFAULT_WINDOWS_NPZ))
     parser.add_argument("--meta-csv", default=str(DEFAULT_WINDOWS_META))
     parser.add_argument("--val-video", required=True)
+    parser.add_argument("--min-speech-ratio", type=float, default=0.0)
+    parser.add_argument("--max-speech-ratio", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -136,6 +138,30 @@ def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> di
     }
 
 
+def tune_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> dict:
+    thresholds = np.linspace(0.05, 0.95, 19)
+    best = {"threshold": 0.5, "f1": -1.0, "precision": 0.0, "recall": 0.0, "acc": 0.0}
+    for t in thresholds:
+        y_pred = (y_prob >= t).astype(np.int32)
+        tp = int(((y_pred == 1) & (y_true == 1)).sum())
+        tn = int(((y_pred == 0) & (y_true == 0)).sum())
+        fp = int(((y_pred == 1) & (y_true == 0)).sum())
+        fn = int(((y_pred == 0) & (y_true == 1)).sum())
+        acc = (tp + tn) / max(1, (tp + tn + fp + fn))
+        prec = tp / max(1, (tp + fp))
+        rec = tp / max(1, (tp + fn))
+        f1 = (2 * prec * rec) / max(1e-9, (prec + rec))
+        if f1 > best["f1"]:
+            best = {
+                "threshold": float(t),
+                "f1": float(f1),
+                "precision": float(prec),
+                "recall": float(rec),
+                "acc": float(acc),
+            }
+    return best
+
+
 def main() -> None:
     args = parse_args()
     cfg = TrainConfig(
@@ -163,6 +189,11 @@ def main() -> None:
             f"Meta rows ({len(meta)}) must match y length ({len(y)})."
         )
 
+    if "speech_ratio" in meta.columns:
+        meta = meta[
+            (meta["speech_ratio"] >= args.min_speech_ratio)
+            & (meta["speech_ratio"] <= args.max_speech_ratio)
+        ].copy()
     val_mask = meta["video_id"].astype(str) == cfg.val_video
     if not bool(val_mask.any()):
         raise ValueError(
@@ -174,6 +205,8 @@ def main() -> None:
 
     X_train, y_train = X[train_idx], y[train_idx]
     X_val, y_val = X[val_idx], y[val_idx]
+    if X_train.size == 0 or X_val.size == 0:
+        raise ValueError("Train/val split is empty after speech_ratio filtering.")
 
     num_points = int(X.shape[2])
     model = TemporalCNN(num_points=num_points).to(device)
@@ -239,13 +272,31 @@ def main() -> None:
             f"val_pos_rate={val_metrics['pos_rate']:.3f}"
         )
 
+    # Threshold tuning on validation set (post-training)
+    model.eval()
+    y_true = []
+    y_prob = []
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            xb = xb.to(device)
+            logits = model(xb)
+            y_true.append(yb.numpy())
+            y_prob.append(torch.sigmoid(logits).cpu().numpy())
+    y_true = np.concatenate(y_true, axis=0)
+    y_prob = np.concatenate(y_prob, axis=0)
+    best_thresh = tune_threshold(y_true, y_prob)
+
     torch.save(model.state_dict(), out_dir / "last.pt")
     pd.DataFrame(history).to_csv(out_dir / "history.csv", index=False)
+    (out_dir / "threshold.json").write_text(json.dumps(best_thresh, indent=2))
 
     print(f"train_windows={len(train_idx)}, val_windows={len(val_idx)}")
     print(f"out_dir={out_dir}")
+    print(
+        f"best_threshold={best_thresh['threshold']:.2f} "
+        f"best_f1={best_thresh['f1']:.3f}"
+    )
 
 
 if __name__ == "__main__":
     main()
-
