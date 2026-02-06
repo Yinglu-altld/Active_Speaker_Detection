@@ -45,6 +45,19 @@ Train a model (split by video_id):
 ./venv/bin/python scripts/step5_train_cnn.py --val-video WwoTG3_OjUg
 ```
 
+For clearer labels, keep only strong negatives/positives:
+
+```bash
+./venv/bin/python scripts/step5_train_cnn.py \
+  --val-video WwoTG3_OjUg --filter-extremes --neg-max 0.1 --pos-min 0.6
+```
+
+Disable delta features if needed:
+
+```bash
+./venv/bin/python scripts/step5_train_cnn.py --val-video WwoTG3_OjUg --no-delta
+```
+
 ## Notes
 
 - `data/` contains large inputs (videos/labels) and generated artifacts (crops/landmarks/windows) and is ignored by git.

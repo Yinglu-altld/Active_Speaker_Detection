@@ -31,9 +31,9 @@ class WindowDataset(Dataset):
 
 
 class TemporalCNN(nn.Module):
-    def __init__(self, num_points: int):
+    def __init__(self, num_points: int, num_channels: int = 2):
         super().__init__()
-        in_ch = num_points * 2
+        in_ch = num_points * num_channels
         self.net = nn.Sequential(
             nn.Conv1d(in_ch, 64, kernel_size=5, padding=2),
             nn.ReLU(),
@@ -56,6 +56,12 @@ class TrainConfig:
     npz: str
     meta_csv: str
     val_video: str
+    min_speech_ratio: float
+    max_speech_ratio: float
+    filter_extremes: bool
+    neg_max: float
+    pos_min: float
+    use_delta: bool
     epochs: int
     batch_size: int
     lr: float
@@ -76,6 +82,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-video", required=True)
     parser.add_argument("--min-speech-ratio", type=float, default=0.0)
     parser.add_argument("--max-speech-ratio", type=float, default=1.0)
+    parser.add_argument(
+        "--filter-extremes",
+        action="store_true",
+        help="Keep only clear negatives (<= neg-max) or clear positives (>= pos-min).",
+    )
+    parser.add_argument("--neg-max", type=float, default=0.1)
+    parser.add_argument("--pos-min", type=float, default=0.6)
+    parser.add_argument(
+        "--no-delta",
+        action="store_true",
+        help="Disable delta features (frame-to-frame landmark differences).",
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -168,6 +186,12 @@ def main() -> None:
         npz=args.npz,
         meta_csv=args.meta_csv,
         val_video=args.val_video,
+        min_speech_ratio=args.min_speech_ratio,
+        max_speech_ratio=args.max_speech_ratio,
+        filter_extremes=args.filter_extremes,
+        neg_max=args.neg_max,
+        pos_min=args.pos_min,
+        use_delta=not args.no_delta,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
@@ -182,18 +206,27 @@ def main() -> None:
     data = np.load(cfg.npz)
     X = data["X"]  # (N, T, P, 2)
     y = data["y"]  # (N,)
-    meta = pd.read_csv(cfg.meta_csv)
+    meta_all = pd.read_csv(cfg.meta_csv)
 
-    if len(meta) != len(y):
+    if len(meta_all) != len(y):
         raise ValueError(
-            f"Meta rows ({len(meta)}) must match y length ({len(y)})."
+            f"Meta rows ({len(meta_all)}) must match y length ({len(y)})."
         )
 
-    if "speech_ratio" in meta.columns:
-        meta = meta[
-            (meta["speech_ratio"] >= args.min_speech_ratio)
-            & (meta["speech_ratio"] <= args.max_speech_ratio)
-        ].copy()
+    mask = np.ones(len(meta_all), dtype=bool)
+    if "speech_ratio" in meta_all.columns:
+        if cfg.filter_extremes:
+            mask &= (meta_all["speech_ratio"] <= cfg.neg_max) | (
+                meta_all["speech_ratio"] >= cfg.pos_min
+            )
+        else:
+            mask &= (meta_all["speech_ratio"] >= cfg.min_speech_ratio) & (
+                meta_all["speech_ratio"] <= cfg.max_speech_ratio
+            )
+    meta = meta_all[mask].reset_index(drop=True)
+    X = X[mask]
+    y = y[mask]
+
     val_mask = meta["video_id"].astype(str) == cfg.val_video
     if not bool(val_mask.any()):
         raise ValueError(
@@ -208,8 +241,20 @@ def main() -> None:
     if X_train.size == 0 or X_val.size == 0:
         raise ValueError("Train/val split is empty after speech_ratio filtering.")
 
+    if cfg.use_delta:
+        def append_delta(arr: np.ndarray) -> np.ndarray:
+            delta = np.zeros_like(arr)
+            delta[:, 1:, :, :] = arr[:, 1:, :, :] - arr[:, :-1, :, :]
+            return np.concatenate([arr, delta], axis=3)
+
+        X_train = append_delta(X_train)
+        X_val = append_delta(X_val)
+        num_channels = 4
+    else:
+        num_channels = 2
+
     num_points = int(X.shape[2])
-    model = TemporalCNN(num_points=num_points).to(device)
+    model = TemporalCNN(num_points=num_points, num_channels=num_channels).to(device)
 
     # Basic class imbalance handling.
     pos = float((y_train == 1).sum())
