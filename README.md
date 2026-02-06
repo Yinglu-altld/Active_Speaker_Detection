@@ -9,6 +9,7 @@ This folder contains a step-by-step pipeline for building a Visual Voice Activit
 - Step 3: face crops → MediaPipe FaceLandmarker landmarks (`scripts/step3_extract_landmarks.py`)
 - Step 3 (batch): all videos/entities → landmarks (`scripts/step3_batch_extract_landmarks.py`)
 - Step 4: landmarks → fixed-length windows for CNN training (`scripts/step4_build_windows.py`)
+- Step 5: train a small CNN (`scripts/step5_train_cnn.py`)
 
 ## Setup
 
@@ -36,6 +37,12 @@ Then build training windows:
 
 ```bash
 ./venv/bin/python scripts/step4_build_windows.py
+```
+
+Train a model (split by video_id):
+
+```bash
+./venv/bin/python scripts/step5_train_cnn.py --val-video WwoTG3_OjUg
 ```
 
 ## Notes

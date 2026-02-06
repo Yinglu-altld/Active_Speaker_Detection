@@ -1,0 +1,251 @@
+import argparse
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_WINDOWS_NPZ = PROJECT_ROOT / "data" / "windows" / "windows.npz"
+DEFAULT_WINDOWS_META = PROJECT_ROOT / "data" / "windows" / "windows_meta.csv"
+DEFAULT_OUT_DIR = PROJECT_ROOT / "data" / "models" / "cnn_vvad"
+
+
+class WindowDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = X.astype(np.float32, copy=False)
+        self.y = y.astype(np.int64, copy=False)
+
+    def __len__(self) -> int:
+        return int(self.X.shape[0])
+
+    def __getitem__(self, idx: int):
+        x = torch.from_numpy(self.X[idx])  # (T, P, 2)
+        y = torch.tensor(int(self.y[idx]), dtype=torch.float32)  # {0,1}
+        return x, y
+
+
+class TemporalCNN(nn.Module):
+    def __init__(self, num_points: int):
+        super().__init__()
+        in_ch = num_points * 2
+        self.net = nn.Sequential(
+            nn.Conv1d(in_ch, 64, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.head = nn.Linear(64, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, P, 2) -> (B, C, T) where C=P*2
+        b, t, p, c = x.shape
+        x = x.reshape(b, t, p * c).transpose(1, 2)
+        feats = self.net(x).squeeze(-1)
+        return self.head(feats).squeeze(-1)  # logits
+
+
+@dataclass(frozen=True)
+class TrainConfig:
+    npz: str
+    meta_csv: str
+    val_video: str
+    epochs: int
+    batch_size: int
+    lr: float
+    weight_decay: float
+    seed: int
+    device: str
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Step 5: Train a small temporal CNN on Step 4 landmark windows.\n"
+            "Split is done by video_id to avoid leakage."
+        )
+    )
+    parser.add_argument("--npz", default=str(DEFAULT_WINDOWS_NPZ))
+    parser.add_argument("--meta-csv", default=str(DEFAULT_WINDOWS_META))
+    parser.add_argument("--val-video", required=True)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+@torch.no_grad()
+def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> dict:
+    model.eval()
+    losses = []
+    y_true = []
+    y_prob = []
+    bce = nn.BCEWithLogitsLoss()
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        logits = model(x)
+        loss = bce(logits, y)
+        losses.append(float(loss.item()))
+        y_true.append(y.detach().cpu().numpy())
+        y_prob.append(torch.sigmoid(logits).detach().cpu().numpy())
+
+    y_true = np.concatenate(y_true, axis=0)
+    y_prob = np.concatenate(y_prob, axis=0)
+    y_pred = (y_prob >= 0.5).astype(np.int32)
+
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+
+    acc = (tp + tn) / max(1, (tp + tn + fp + fn))
+    prec = tp / max(1, (tp + fp))
+    rec = tp / max(1, (tp + fn))
+    f1 = (2 * prec * rec) / max(1e-9, (prec + rec))
+
+    return {
+        "loss": float(np.mean(losses)) if losses else float("nan"),
+        "acc": float(acc),
+        "precision": float(prec),
+        "recall": float(rec),
+        "f1": float(f1),
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "pos_rate": float(y_true.mean()) if y_true.size else float("nan"),
+        "pred_pos_rate": float(y_pred.mean()) if y_pred.size else float("nan"),
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = TrainConfig(
+        npz=args.npz,
+        meta_csv=args.meta_csv,
+        val_video=args.val_video,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        seed=args.seed,
+        device=args.device,
+    )
+
+    set_seed(cfg.seed)
+    device = torch.device(cfg.device)
+
+    data = np.load(cfg.npz)
+    X = data["X"]  # (N, T, P, 2)
+    y = data["y"]  # (N,)
+    meta = pd.read_csv(cfg.meta_csv)
+
+    if len(meta) != len(y):
+        raise ValueError(
+            f"Meta rows ({len(meta)}) must match y length ({len(y)})."
+        )
+
+    val_mask = meta["video_id"].astype(str) == cfg.val_video
+    if not bool(val_mask.any()):
+        raise ValueError(
+            f"--val-video {cfg.val_video!r} not found in windows_meta.csv"
+        )
+
+    train_idx = np.where(~val_mask.to_numpy())[0]
+    val_idx = np.where(val_mask.to_numpy())[0]
+
+    X_train, y_train = X[train_idx], y[train_idx]
+    X_val, y_val = X[val_idx], y[val_idx]
+
+    num_points = int(X.shape[2])
+    model = TemporalCNN(num_points=num_points).to(device)
+
+    # Basic class imbalance handling.
+    pos = float((y_train == 1).sum())
+    neg = float((y_train == 0).sum())
+    pos_weight = torch.tensor([neg / max(1.0, pos)], device=device)
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    opt = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
+
+    train_loader = DataLoader(
+        WindowDataset(X_train, y_train),
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        WindowDataset(X_val, y_val),
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
+
+    best_f1 = -1.0
+    history = []
+
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        train_losses = []
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            opt.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
+            loss.backward()
+            opt.step()
+            train_losses.append(float(loss.item()))
+
+        val_metrics = eval_epoch(model, val_loader, device)
+        row = {
+            "epoch": epoch,
+            "train_loss": float(np.mean(train_losses)) if train_losses else float("nan"),
+            **{f"val_{k}": v for k, v in val_metrics.items()},
+        }
+        history.append(row)
+
+        if val_metrics["f1"] > best_f1:
+            best_f1 = val_metrics["f1"]
+            torch.save(model.state_dict(), out_dir / "best.pt")
+
+        print(
+            f"epoch={epoch} train_loss={row['train_loss']:.4f} "
+            f"val_f1={val_metrics['f1']:.3f} val_acc={val_metrics['acc']:.3f} "
+            f"val_pos_rate={val_metrics['pos_rate']:.3f}"
+        )
+
+    torch.save(model.state_dict(), out_dir / "last.pt")
+    pd.DataFrame(history).to_csv(out_dir / "history.csv", index=False)
+
+    print(f"train_windows={len(train_idx)}, val_windows={len(val_idx)}")
+    print(f"out_dir={out_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
