@@ -13,10 +13,10 @@ This repo contains an external **Perception Controller** (runs on your PC) that:
 
 To run a file from the current folder, prefix it with `.\`:
 
-- ✅ `.\run_furhat_asd.cmd`
-- ✅ `python .\run_2speaker_test.py`
-- ❌ `run run_furhat_asd.cmd`
-- ❌ `run_2speaker_test.py`
+- OK: `.\run_furhat_asd.cmd`
+- OK: `python .\run_2speaker_test.py`
+- NO: `run run_furhat_asd.cmd`
+- NO: `run_2speaker_test.py`
 
 ### 1) Create a venv
 
@@ -51,6 +51,50 @@ Then edit `config.json`:
 .\run_furhat_asd.cmd
 ```
 
+`run_furhat_asd.cmd` is a Windows-only convenience wrapper. The cross-platform “main command” is:
+
+```powershell
+python -m furhat_asd --config config.json
+```
+
+If the CLI entrypoint is installed, this also works:
+
+```powershell
+furhat-asd --config config.json
+```
+
+## Quick start (macOS / Linux)
+
+macOS/Linux cannot run `.cmd` files. Use the Python command instead.
+
+### 1) Create a venv
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+```
+
+### 2) Install (editable) + Silero VAD
+
+```bash
+pip install -e ".[vad_silero]"
+```
+
+### 3) Create `config.json`
+
+```bash
+cp config.example.json config.json
+```
+
+Edit `config.json` and set `furhat.ip` to your Furhat robot IP.
+
+### 4) Run the full controller (main command)
+
+```bash
+python -m furhat_asd --config config.json
+```
+
 ## VAD
 
 Supported VAD backends:
@@ -81,9 +125,9 @@ furhat-asd-doa-test --config config.doa_pc_test.json
 
 ### ReSpeaker 4-Mic Array v2.0 channel note
 
-With the common **6-channel firmware**, channel `0` is a processed stream and channels **1–4** are the raw microphone signals (channel 5 is playback). For DOA, select channels 1–4 via `audio.channel_indices`.
+With the common **6-channel firmware**, channel `0` is a processed stream and channels **1-4** are the raw microphone signals (channel 5 is playback). For DOA, select channels 1-4 via `audio.channel_indices`.
 
-On many systems, the **6-channel UAC1.0 mode** is only available at **16 kHz**. If you see “Invalid sample rate”, set `audio.sample_rate` to `16000`.
+On many systems, the **6-channel UAC1.0 mode** is only available at **16 kHz**. If you see "Invalid sample rate", set `audio.sample_rate` to `16000`.
 
 ### Calibrate channel order + offset (recommended)
 
@@ -101,9 +145,9 @@ This prints:
 ## Multi-user behavior (important)
 
 - DOA gives **one dominant direction at a time**. If two people speak at the same time, this system will usually pick the louder / more dominant speaker. Separating overlapping speakers requires adding the CNN/vision score (late fusion) and/or diarization/beamforming.
-- To map DOA → `user_id`, Furhat must detect both people as `users` at the same time. If you see `users=0`, make sure faces are visible to the robot camera.
+- To map DOA -> `user_id`, Furhat must detect both people as `users` at the same time. If you see `users=0`, make sure faces are visible to the robot camera.
 
-## Repo hygiene (remove “junk files”)
+## Repo hygiene (remove "junk files")
 
 Do not commit:
 
