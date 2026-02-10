@@ -26,6 +26,20 @@ Step 3 uses MediaPipe Tasks `FaceLandmarker` and requires a `.task` model file.
 
 - Put the model at `data/models/face_landmarker_v2.task`
 
+## Dataset
+
+This project uses the **AVA Active Speaker** annotations and corresponding video clips.
+In this repo we worked with a small subset of **6 videos**:
+
+- `2bxKkUgcqpk`
+- `9bK05eBt1GM`
+- `Ag-pXiLrd48`
+- `B1MAUxpKaV8`
+- `WwoTG3_OjUg`
+- `a5mEmM6w_ks`
+
+Labels are read from `data/labels/<video_id>-activespeaker.csv` and videos from `data/videos/<video_id>.mp4`.
+
 ## Batch processing (data prep)
 
 Extract landmarks for all tracks (or a subset):
