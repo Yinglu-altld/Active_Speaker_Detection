@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "furhat-asd"
+version = "0.1.0"
+description = "Furhat Active Speaker Detection controller using Realtime API + ReSpeaker VAD/DOA"
+requires-python = ">=3.11"
+dependencies = [
+  "websockets>=12.0",
+  "numpy>=1.26",
+  "sounddevice>=0.4.6",
+]
+
+[project.scripts]
+furhat-asd = "furhat_asd.__main__:main"
+furhat-asd-sidecar = "furhat_asd.sidecar.audio_sidecar:main"
+furhat-asd-doa-test = "furhat_asd.tools.doa_test:main"
+furhat-asd-audio-levels = "furhat_asd.tools.audio_levels:main"
+furhat-asd-doa-calibrate = "furhat_asd.tools.doa_calibrate:main"
+furhat-asd-vad-test = "furhat_asd.tools.vad_test:main"
+
+[project.optional-dependencies]
+vision = [
+  "opencv-python>=4.9.0",
+  "mediapipe>=0.10.9",
+]
+vad_silero = [
+  "torch>=2.2.0",
+  "silero-vad",
+]
+vad_webrtc = [
+  "webrtcvad>=2.0.10",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
