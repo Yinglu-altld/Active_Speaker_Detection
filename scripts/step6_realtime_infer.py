@@ -47,6 +47,15 @@ class TrackState:
     is_speaking: bool | None = None
 
 
+@dataclass
+class UserBox:
+    user_id: str
+    x: int
+    y: int
+    w: int
+    h: int
+
+
 class FrameRateLimiter:
     def __init__(self, target_fps: float | None):
         self.target_fps = target_fps
@@ -134,6 +143,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-track-conf", type=float, default=0.5)
     parser.add_argument("--infer-stride", type=int, default=1)
     parser.add_argument("--ema", type=float, default=0.0)
+    parser.add_argument(
+        "--bbox-padding",
+        type=float,
+        default=0.2,
+        help="Padding ratio to expand Furhat user camera bbox before cropping.",
+    )
     parser.add_argument(
         "--speak-on-th",
         type=float,
@@ -280,21 +295,50 @@ def infer_window(
     return float(prob)
 
 
+def prob_color(prob: float) -> tuple[int, int, int]:
+    if prob < 0.4:
+        return (0, 0, 255)
+    if prob < 0.8:
+        return (0, 255, 255)
+    return (0, 255, 0)
+
+
 def draw_overlays(frame, outputs) -> None:
     y = 24
-    for track_id, prob_out, speak in outputs:
-        label = f"{track_id} {prob_out:.2f} {'SPEAK' if speak else 'SILENT'}"
-        cv2.putText(
-            frame,
-            label,
-            (10, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0) if speak else (0, 0, 255),
-            2,
-            lineType=cv2.LINE_AA,
-        )
-        y += 22
+    for out in outputs:
+        track_id = out["track_id"]
+        prob_out = out["prob"]
+        speak = out["speak"]
+        bbox = out.get("bbox")
+        label = f"{track_id} {prob_out:.2f} {int(speak)}"
+        color = prob_color(prob_out)
+        if bbox:
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            text_x = x1
+            text_y = max(18, y1 - 6)
+            cv2.putText(
+                frame,
+                label,
+                (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+                lineType=cv2.LINE_AA,
+            )
+        else:
+            cv2.putText(
+                frame,
+                label,
+                (10, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+                lineType=cv2.LINE_AA,
+            )
+            y += 22
 
 
 def draw_landmark_points(frame, landmarks, indices, color=(0, 255, 0)) -> None:
@@ -306,6 +350,34 @@ def draw_landmark_points(frame, landmarks, indices, color=(0, 255, 0)) -> None:
         x = int(pt.x * w)
         y = int(pt.y * h)
         cv2.circle(frame, (x, y), 1, color, -1, lineType=cv2.LINE_AA)
+
+
+def draw_landmark_points_offset(
+    frame, landmarks, indices, x1: int, y1: int, w: int, h: int, color=(0, 255, 0)
+) -> None:
+    for i in indices:
+        if i >= len(landmarks):
+            continue
+        pt = landmarks[i]
+        x = int(x1 + pt.x * w)
+        y = int(y1 + pt.y * h)
+        cv2.circle(frame, (x, y), 1, color, -1, lineType=cv2.LINE_AA)
+
+
+def clamp_bbox(x1: float, y1: float, x2: float, y2: float, w: int, h: int):
+    x1 = max(0, int(np.floor(x1)))
+    y1 = max(0, int(np.floor(y1)))
+    x2 = min(w, int(np.ceil(x2)))
+    y2 = min(h, int(np.ceil(y2)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def expand_bbox(x: int, y: int, w: int, h: int, pad: float):
+    pad_x = w * pad
+    pad_y = h * pad
+    return x - pad_x, y - pad_y, x + w + pad_x, y + h + pad_y
 
 
 def process_frame(
@@ -320,78 +392,123 @@ def process_frame(
     args: argparse.Namespace,
     limiter: FrameRateLimiter,
     print_state: dict,
+    user_boxes: list[UserBox] | None,
 ) -> bool:
     now = time.time()
     if not limiter.should_process(now):
         return True
 
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mp_image = image_module.Image(
-        image_module.ImageFormat.SRGB, np.ascontiguousarray(frame_rgb)
-    )
-    result = landmarker.detect(mp_image)
-    faces = result.face_landmarks or []
-
     outputs = []
     speak_on = args.speak_on_th if args.speak_on_th is not None else spec.threshold
     speak_off = args.speak_off_th if args.speak_off_th is not None else spec.threshold
-    for idx, face_landmarks in enumerate(faces):
-        if args.draw_landmarks:
-            draw_landmark_points(frame, face_landmarks, spec.indices, color=(0, 255, 0))
-        features = extract_features(
-            face_landmarks,
-            spec.indices,
-            oval_indices,
-            spec.feature_type,
-            args.min_oval_size,
-            args.max_oval_size,
-            args.edge_margin,
+    if user_boxes is None:
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = image_module.Image(
+            image_module.ImageFormat.SRGB, np.ascontiguousarray(frame_rgb)
         )
-        if features is None:
-            continue
-
-        track_id = f"face_{idx}"
-        state = states.get(track_id)
-        if state is None:
-            state = TrackState(buffer=deque(maxlen=spec.window_frames))
-            states[track_id] = state
-
-        state.buffer.append(features)
-        state.seen += 1
-        if len(state.buffer) < spec.window_frames:
-            continue
-
-        if args.infer_stride > 1 and (state.seen % args.infer_stride) != 0:
-            continue
-
-        prob = infer_window(state.buffer, model, device, spec.use_delta)
-        if args.ema > 0:
-            if state.ema_prob is None:
-                state.ema_prob = prob
-            else:
-                state.ema_prob = args.ema * prob + (1.0 - args.ema) * state.ema_prob
-            prob_out = state.ema_prob
-        else:
-            prob_out = prob
-
-        if state.is_speaking is None:
-            state.is_speaking = prob_out >= speak_on
-        elif state.is_speaking:
-            if prob_out < speak_off:
-                state.is_speaking = False
-        else:
-            if prob_out >= speak_on:
-                state.is_speaking = True
-
-        speak = bool(state.is_speaking)
-        outputs.append((track_id, prob_out, speak))
+        result = landmarker.detect(mp_image)
+        faces = result.face_landmarks or []
+        for idx, face_landmarks in enumerate(faces):
+            if args.draw_landmarks:
+                draw_landmark_points(
+                    frame, face_landmarks, spec.indices, color=(0, 255, 0)
+                )
+            features = extract_features(
+                face_landmarks,
+                spec.indices,
+                oval_indices,
+                spec.feature_type,
+                args.min_oval_size,
+                args.max_oval_size,
+                args.edge_margin,
+            )
+            if features is None:
+                continue
+            outputs.extend(
+                update_track_state(
+                    f"face_{idx}",
+                    features,
+                    states,
+                    spec,
+                    model,
+                    device,
+                    args,
+                    speak_on,
+                    speak_off,
+                    None,
+                )
+            )
+    else:
+        if not user_boxes:
+            if args.show and int(now) != print_state["last_print"]:
+                print_state["last_print"] = int(now)
+                print("no users")
+            if args.show:
+                cv2.imshow("vvad_realtime", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    return False
+            return True
+        frame_h, frame_w = frame.shape[:2]
+        for user in user_boxes:
+            x1, y1, x2, y2 = expand_bbox(
+                user.x, user.y, user.w, user.h, args.bbox_padding
+            )
+            bbox = clamp_bbox(x1, y1, x2, y2, frame_w, frame_h)
+            if bbox is None:
+                continue
+            x1i, y1i, x2i, y2i = bbox
+            crop = frame[y1i:y2i, x1i:x2i]
+            if crop.size == 0:
+                continue
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            crop_image = image_module.Image(
+                image_module.ImageFormat.SRGB, np.ascontiguousarray(crop_rgb)
+            )
+            result = landmarker.detect(crop_image)
+            faces = result.face_landmarks or []
+            if not faces:
+                continue
+            face_landmarks = faces[0]
+            if args.draw_landmarks:
+                draw_landmark_points_offset(
+                    frame,
+                    face_landmarks,
+                    spec.indices,
+                    x1i,
+                    y1i,
+                    x2i - x1i,
+                    y2i - y1i,
+                    color=(0, 255, 0),
+                )
+            features = extract_features(
+                face_landmarks,
+                spec.indices,
+                oval_indices,
+                spec.feature_type,
+                args.min_oval_size,
+                args.max_oval_size,
+                args.edge_margin,
+            )
+            if features is None:
+                continue
+            outputs.extend(
+                update_track_state(
+                    user.user_id,
+                    features,
+                    states,
+                    spec,
+                    model,
+                    device,
+                    args,
+                    speak_on,
+                    speak_off,
+                    (x1i, y1i, x2i, y2i),
+                )
+            )
 
     if outputs:
-        for track_id, prob_out, speak in outputs:
-            print(
-                f"{track_id} prob={prob_out:.3f} "
-                f"speak={int(speak)} threshold={spec.threshold:.2f}"
-            )
+        for out in outputs:
+            print(f"{out['track_id']} {out['prob']:.3f} {int(out['speak'])}")
     elif args.show and int(now) != print_state["last_print"]:
         print_state["last_print"] = int(now)
         print("no face")
@@ -402,6 +519,60 @@ def process_frame(
         if cv2.waitKey(1) & 0xFF == ord("q"):
             return False
     return True
+
+
+def update_track_state(
+    track_id: str,
+    features: np.ndarray,
+    states: dict[str, TrackState],
+    spec: ModelSpec,
+    model: torch.nn.Module,
+    device: torch.device,
+    args: argparse.Namespace,
+    speak_on: float,
+    speak_off: float,
+    bbox: tuple[int, int, int, int] | None = None,
+) -> list[dict]:
+    state = states.get(track_id)
+    if state is None:
+        state = TrackState(buffer=deque(maxlen=spec.window_frames))
+        states[track_id] = state
+
+    state.buffer.append(features)
+    state.seen += 1
+    if len(state.buffer) < spec.window_frames:
+        return []
+
+    if args.infer_stride > 1 and (state.seen % args.infer_stride) != 0:
+        return []
+
+    prob = infer_window(state.buffer, model, device, spec.use_delta)
+    if args.ema > 0:
+        if state.ema_prob is None:
+            state.ema_prob = prob
+        else:
+            state.ema_prob = args.ema * prob + (1.0 - args.ema) * state.ema_prob
+        prob_out = state.ema_prob
+    else:
+        prob_out = prob
+
+    if state.is_speaking is None:
+        state.is_speaking = prob_out >= speak_on
+    elif state.is_speaking:
+        if prob_out < speak_off:
+            state.is_speaking = False
+    else:
+        if prob_out >= speak_on:
+            state.is_speaking = True
+
+    return [
+        {
+            "track_id": track_id,
+            "prob": float(prob_out),
+            "speak": bool(state.is_speaking),
+            "bbox": bbox,
+        }
+    ]
 
 
 async def run_furhat_stream(
@@ -426,6 +597,7 @@ async def run_furhat_stream(
         raise ValueError("--furhat-ip is required when --source=furhat")
 
     frame_queue: deque[np.ndarray] = deque(maxlen=1)
+    latest_users: list[UserBox] = []
 
     async def on_camera(event):
         image_b64 = None
@@ -444,10 +616,44 @@ async def run_furhat_stream(
         except Exception:
             return
 
+    async def on_users(event):
+        nonlocal latest_users
+        users = None
+        if isinstance(event, dict):
+            users = event.get("users")
+        else:
+            users = getattr(event, "users", None)
+        if users is None:
+            return
+        if not users:
+            latest_users = []
+            return
+        parsed: list[UserBox] = []
+        for user in users:
+            camera = user.get("camera") if isinstance(user, dict) else getattr(user, "camera", None)
+            user_id = user.get("id") if isinstance(user, dict) else getattr(user, "id", None)
+            if not camera or not user_id:
+                continue
+            try:
+                parsed.append(
+                    UserBox(
+                        user_id=str(user_id),
+                        x=int(camera.get("x")),
+                        y=int(camera.get("y")),
+                        w=int(camera.get("w")),
+                        h=int(camera.get("h")),
+                    )
+                )
+            except Exception:
+                continue
+        latest_users = parsed
+
     client = AsyncFurhatClient(args.furhat_ip, args.furhat_auth)
     await client.connect()
     client.add_handler(Events.response_camera_data, on_camera)
+    client.add_handler(Events.response_users_data, on_users)
     await client.request_camera_start()
+    await client.request_users_start()
 
     states: dict[str, TrackState] = {}
     print_state = {"last_print": 0}
@@ -469,12 +675,14 @@ async def run_furhat_stream(
                 args,
                 limiter,
                 print_state,
+                latest_users,
             )
             if not keep_running:
                 break
             await asyncio.sleep(0)
     finally:
         await client.request_camera_stop()
+        await client.request_users_stop()
         await client.disconnect()
 
 
@@ -568,6 +776,7 @@ def main() -> None:
                     args,
                     limiter,
                     print_state,
+                    None,
                 ):
                     break
             cap.release()

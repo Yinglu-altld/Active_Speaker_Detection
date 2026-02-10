@@ -79,6 +79,9 @@ Run real-time inference (Furhat stream):
 ./venv/bin/python scripts/step6_realtime_infer.py --furhat-ip <FURHAT_IP> --show
 ```
 
+For multi-user Furhat mode, the script uses `response.users.data` camera bboxes
+to crop each user and runs inference per `user_id`.
+
 Run real-time inference (local webcam):
 
 ```bash
