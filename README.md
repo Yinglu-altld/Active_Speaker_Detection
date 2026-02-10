@@ -108,6 +108,18 @@ Run real-time inference from a generic stream URL (MJPEG/RTSP):
 ./venv/bin/python scripts/step6_realtime_infer.py --source stream --stream-url <STREAM_URL> --show
 ```
 
+Landmarks are drawn by default. Disable with:
+
+```bash
+./venv/bin/python scripts/step6_realtime_infer.py --no-draw-landmarks
+```
+
+Optional small-face upsampling (improves distant faces):
+
+```bash
+./venv/bin/python scripts/step6_realtime_infer.py --upsample-small-faces
+```
+
 ## Final run used (current best)
 
 These are the exact choices used for the current model:

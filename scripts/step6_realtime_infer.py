@@ -150,6 +150,23 @@ def parse_args() -> argparse.Namespace:
         help="Padding ratio to expand Furhat user camera bbox before cropping.",
     )
     parser.add_argument(
+        "--min-bbox-area-ratio",
+        type=float,
+        default=0.02,
+        help="If bbox area / frame area is below this, upsample the crop.",
+    )
+    parser.add_argument(
+        "--min-bbox-side",
+        type=int,
+        default=160,
+        help="Upsample small bboxes so their min side reaches this size (pixels).",
+    )
+    parser.add_argument(
+        "--upsample-small-faces",
+        action="store_true",
+        help="Enable conditional upsampling for small face crops.",
+    )
+    parser.add_argument(
         "--speak-on-th",
         type=float,
         default=None,
@@ -163,7 +180,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--show", action="store_true")
-    parser.add_argument("--draw-landmarks", action="store_true")
+    parser.add_argument(
+        "--no-draw-landmarks",
+        dest="draw_landmarks",
+        action="store_false",
+        help="Disable landmark drawing (enabled by default).",
+    )
+    parser.set_defaults(draw_landmarks=True)
     return parser.parse_args()
 
 
@@ -380,6 +403,23 @@ def expand_bbox(x: int, y: int, w: int, h: int, pad: float):
     return x - pad_x, y - pad_y, x + w + pad_x, y + h + pad_y
 
 
+def maybe_upsample_crop(
+    crop: np.ndarray, bbox_w: int, bbox_h: int, frame_w: int, frame_h: int, args: argparse.Namespace
+) -> np.ndarray:
+    area_ratio = (bbox_w * bbox_h) / max(1.0, float(frame_w * frame_h))
+    if area_ratio >= args.min_bbox_area_ratio:
+        return crop
+    min_side = max(1, min(bbox_w, bbox_h))
+    if min_side >= args.min_bbox_side:
+        return crop
+    scale = args.min_bbox_side / float(min_side)
+    new_w = int(round(bbox_w * scale))
+    new_h = int(round(bbox_h * scale))
+    if new_w <= 0 or new_h <= 0:
+        return crop
+    return cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
 def process_frame(
     frame: np.ndarray,
     landmarker,
@@ -460,6 +500,15 @@ def process_frame(
             crop = frame[y1i:y2i, x1i:x2i]
             if crop.size == 0:
                 continue
+            if args.upsample_small_faces:
+                crop = maybe_upsample_crop(
+                    crop,
+                    x2i - x1i,
+                    y2i - y1i,
+                    frame_w,
+                    frame_h,
+                    args,
+                )
             crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
             crop_image = image_module.Image(
                 image_module.ImageFormat.SRGB, np.ascontiguousarray(crop_rgb)
