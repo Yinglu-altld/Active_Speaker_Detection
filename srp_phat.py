@@ -17,11 +17,21 @@ def _gcc_phat_curve(
     fs: int,
     max_tau_s: float,
     interp: int,
+    f_low_hz: Optional[float] = None,
+    f_high_hz: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     n_fft = _next_pow2(sig_a.shape[0] + sig_b.shape[0])
     a = np.fft.rfft(sig_a, n=n_fft)
     b = np.fft.rfft(sig_b, n=n_fft)
     r = a * np.conj(b)
+    if f_low_hz is not None or f_high_hz is not None:
+        freqs = np.fft.rfftfreq(n_fft, d=1.0 / fs)
+        f_low = 0.0 if f_low_hz is None else max(0.0, float(f_low_hz))
+        f_high = (fs * 0.5) if f_high_hz is None else min(fs * 0.5, float(f_high_hz))
+        if f_high > f_low:
+            band = (freqs >= f_low) & (freqs <= f_high)
+            if np.any(band):
+                r *= band.astype(np.float64)
     r /= np.abs(r) + 1e-12
     cc = np.fft.irfft(r, n=n_fft * interp)
     max_shift = int(interp * fs * max_tau_s)
@@ -44,9 +54,13 @@ class SRPPhatDOA:
         az_max_deg: float = 180.0,
         az_step_deg: float = 2.0,
         interp: int = 4,
+        f_low_hz: Optional[float] = 300.0,
+        f_high_hz: Optional[float] = 3400.0,
     ):
         self.fs = fs
         self.interp = interp
+        self.f_low_hz = f_low_hz
+        self.f_high_hz = f_high_hz
         self.mic_xy = np.asarray(mic_xy_m, dtype=np.float64)
         self.az_grid = np.arange(az_min_deg, az_max_deg + 0.5 * az_step_deg, az_step_deg, dtype=np.float64)
         az_rad = np.deg2rad(self.az_grid)
@@ -68,7 +82,15 @@ class SRPPhatDOA:
 
         scores = np.zeros(self.az_grid.shape[0], dtype=np.float64)
         for i, j, dx, dy, dist in self.pairs:
-            lags, cc_abs = _gcc_phat_curve(mics[:, i], mics[:, j], self.fs, dist / C_SOUND, self.interp)
+            lags, cc_abs = _gcc_phat_curve(
+                mics[:, i],
+                mics[:, j],
+                self.fs,
+                dist / C_SOUND,
+                self.interp,
+                self.f_low_hz,
+                self.f_high_hz,
+            )
             tau_pred = (dx * self.dir_xy[:, 0] + dy * self.dir_xy[:, 1]) / C_SOUND
             pair_score = np.interp(tau_pred, lags, cc_abs, left=0.0, right=0.0)
             scores += pair_score

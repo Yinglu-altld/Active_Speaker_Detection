@@ -124,17 +124,6 @@ class FurhatWS:
         }
         self._send(payload)
 
-    def attend_user(self, user_id):
-        payload = {
-            "type": "request.attend.user",
-            "user_id": user_id,
-            "speed": self.speed,
-            "slack_pitch": self.slack_pitch,
-            "slack_yaw": self.slack_yaw,
-            "slack_timeout": self.slack_timeout,
-        }
-        self._send(payload)
-
 
 def map_doa_to_az(doa, board_cw, offset, add_180, front_only, max_az):
     az1 = wrap(offset + ((-doa) if board_cw else doa) + (180.0 if add_180 else 0.0))
@@ -191,6 +180,8 @@ def main():
     p.add_argument("--frame-ms", type=int, default=80)
     p.add_argument("--srp-az-step-deg", type=float, default=2.0)
     p.add_argument("--srp-interp", type=int, default=4)
+    p.add_argument("--srp-f-low-hz", type=float, default=300.0)
+    p.add_argument("--srp-f-high-hz", type=float, default=3400.0)
     p.add_argument("--board-zero-offset", type=float, default=-45.0)
     p.add_argument("--board-cw", action="store_true", default=False)
     p.add_argument("--no-board-cw", action="store_false", dest="board_cw")
@@ -202,18 +193,19 @@ def main():
     p.add_argument("--speaker-switch-deg", type=float, default=45.0, help="force switch lock if candidate stays this far from current lock")
     p.add_argument("--speaker-switch-updates", type=int, default=2, help="consistent far-apart updates needed to force speaker switch")
     p.add_argument("--consistency-deg", type=float, default=25.0, help="max azimuth spread for consistent DOA updates")
-    p.add_argument("--min-consistent-updates", type=int, default=1, help="required consistent DOA updates before lock update")
+    p.add_argument("--min-consistent-updates", type=int, default=3, help="required consistent DOA updates before lock update")
     p.add_argument("--doa-quality-threshold", type=float, default=0.15)
-    p.add_argument("--vad-threshold", type=float, default=0.25)
+    p.add_argument("--vad-threshold", type=float, default=0.18)
     p.add_argument("--vad-update-threshold", type=float, default=0.25, help="minimum VAD prob required to update DOA")
     p.add_argument("--energy-threshold", type=float, default=220.0, help="fallback speech gate on mean abs mono int16")
-    p.add_argument("--energy-update-threshold", type=float, default=220.0, help="fallback update gate when VAD is uncertain")
-    p.add_argument("--speech-hold-ms", type=int, default=350, help="continue tracking this long after VAD drops")
+    p.add_argument("--energy-update-threshold", type=float, default=150.0, help="fallback update gate when VAD is uncertain")
+    p.add_argument("--speech-hold-ms", type=int, default=600, help="continue tracking this long after VAD drops")
     p.add_argument("--front-only", action="store_true", default=True)
     p.add_argument("--no-front-only", action="store_false", dest="front_only")
     p.add_argument("--use-mirror-branch", action="store_true", default=False, help="use mirrored azimuth candidate (legacy behavior)")
     p.add_argument("--max-az-deg", type=float, default=60.0)
-    p.add_argument("--target-distance-m", type=float, default=1.2)
+    p.add_argument("--az-gain", type=float, default=0.55, help="scale commanded azimuth to reduce over-tilt at extremes")
+    p.add_argument("--target-distance-m", type=float, default=1.8)
     p.add_argument("--target-y-m", type=float, default=0.0)
     p.add_argument("--flip-x", action="store_true", default=True, help="mirror left/right by negating x")
     p.add_argument("--no-flip-x", action="store_false", dest="flip_x")
@@ -221,14 +213,10 @@ def main():
     p.add_argument("--hybrid-side-threshold-m", type=float, default=0.08, help="minimum |x| to treat DOA/user side as left/right")
     p.add_argument("--hybrid-no-camera-policy", choices=("hold", "closest-user", "doa"), default="hold")
     p.add_argument("--hybrid-camera-hold-ms", type=int, default=1500, help="how long to hold last camera target if users data drops")
-    p.add_argument("--doa-user-max-diff-deg", type=float, default=45.0, help="max angular difference to match DOA with a camera user")
+    p.add_argument("--doa-user-max-diff-deg", type=float, default=30.0, help="max angular difference to match DOA with a camera user")
     p.add_argument("--doa-user-hold-ms", type=int, default=0, help="hold last matched user location before DOA fallback")
-    p.add_argument("--doa-user-final-attend-user", action="store_true", default=True, help="after DOA match, switch to attend.user only on speaker change")
-    p.add_argument("--no-doa-user-final-attend-user", action="store_false", dest="doa_user_final_attend_user")
-    p.add_argument("--doa-user-switch-cooldown-ms", type=int, default=350, help="minimum time between attend.user speaker switches")
-    p.add_argument("--doa-user-hold-attend-user-ms", type=int, default=900, help="hold last attended user through short unmatched windows")
-    p.add_argument("--doa-user-min-hits", type=int, default=2, help="consecutive good matches required before using camera user target")
-    p.add_argument("--doa-user-match-blend", type=float, default=0.35, help="blend camera user target with DOA target in doa-user-match mode")
+    p.add_argument("--doa-user-min-hits", type=int, default=3, help="consecutive good matches required before using camera user target")
+    p.add_argument("--doa-user-match-blend", type=float, default=0.20, help="blend camera user target with DOA target in doa-user-match mode")
     p.add_argument("--doa-user-min-z", type=float, default=0.35, help="ignore users closer than this distance (m)")
     p.add_argument("--doa-user-max-z", type=float, default=2.50, help="ignore users farther than this distance (m)")
     p.add_argument("--doa-user-side-threshold-m", type=float, default=0.08, help="minimum |x| to compare DOA/user left-right side")
@@ -251,7 +239,14 @@ def main():
         a.slack_yaw,
         a.slack_timeout,
     )
-    srp = SRPPhatDOA(MIC_XY, fs=a.fs, az_step_deg=a.srp_az_step_deg, interp=a.srp_interp)
+    srp = SRPPhatDOA(
+        MIC_XY,
+        fs=a.fs,
+        az_step_deg=a.srp_az_step_deg,
+        interp=a.srp_interp,
+        f_low_hz=a.srp_f_low_hz,
+        f_high_hz=a.srp_f_high_hz,
+    )
     sm_az = None
     locked_az = None
     pending_az = None
@@ -263,9 +258,6 @@ def main():
     last_doa_match_ts = 0.0
     active_doa_user_id = None
     active_doa_user_hits = 0
-    current_attended_user_id_raw = None
-    current_attended_user_id_key = None
-    current_attended_user_ts = 0.0
     last_users_once_ts = 0.0
     last_send = 0.0
     min_period = 1.0 / max(a.update_hz, 1e-3)
@@ -316,9 +308,6 @@ def main():
                     switch_count = 0
                     active_doa_user_id = None
                     active_doa_user_hits = 0
-                    current_attended_user_id_raw = None
-                    current_attended_user_id_key = None
-                    current_attended_user_ts = 0.0
                     last_doa_match_xyz = None
                     last_doa_match_ts = 0.0
                     if hasattr(vad.model, "reset_states"):
@@ -383,7 +372,8 @@ def main():
                 if time.time() - last_send < min_period: continue
                 doa_available = sm_az is not None
                 if doa_available:
-                    ang = math.radians(sm_az)
+                    az_cmd = max(-abs(a.max_az_deg), min(abs(a.max_az_deg), float(sm_az) * float(a.az_gain)))
+                    ang = math.radians(az_cmd)
                     x = float(a.target_distance_m * math.sin(ang))
                     if a.flip_x: x = -x
                     y = float(a.target_y_m)
@@ -448,12 +438,11 @@ def main():
                         last_users_once_ts = now
                         users = furhat.get_users()
 
-                    matched_uid_raw = None
-                    matched_uid_key = None
+                    matched_uid = None
                     matched_xyz = None
                     best_diff = 1e9
                     if doa_updated:
-                        doa_bearing = math.degrees(math.atan2(x, z))
+                        doa_bearing = float(sm_az)
                         doa_side = 0
                         if abs(x) >= a.doa_user_side_threshold_m:
                             doa_side = 1 if x > 0 else -1
@@ -474,15 +463,13 @@ def main():
                             if diff < best_diff:
                                 best_diff = diff
                                 matched_xyz = (ux, uy, uz)
-                                uid_raw = u.get("id", u.get("userId", u.get("user_id")))
-                                matched_uid_raw = uid_raw
-                                matched_uid_key = str(uid_raw) if uid_raw is not None else f"idx:{i}"
+                                matched_uid = str(u.get("id", u.get("userId", u.get("user_id", i))))
 
                     if matched_xyz is not None and best_diff <= abs(a.doa_user_max_diff_deg):
-                        if matched_uid_key == active_doa_user_id:
+                        if matched_uid == active_doa_user_id:
                             active_doa_user_hits += 1
                         else:
-                            active_doa_user_id = matched_uid_key
+                            active_doa_user_id = matched_uid
                             active_doa_user_hits = 1
 
                         if active_doa_user_hits >= max(1, a.doa_user_min_hits):
@@ -491,26 +478,8 @@ def main():
                             x = (1.0 - b) * x + b * ux
                             y = (1.0 - b) * y + b * uy
                             z = (1.0 - b) * z + b * uz
-                            if a.doa_user_final_attend_user and matched_uid_raw is not None:
-                                since_switch_ms = (now - current_attended_user_ts) * 1000.0
-                                switch_allowed = (
-                                    current_attended_user_id_key is None
-                                    or matched_uid_key != current_attended_user_id_key
-                                ) and since_switch_ms >= max(0, a.doa_user_switch_cooldown_ms)
-                                if switch_allowed:
-                                    furhat.attend_user(matched_uid_raw)
-                                    current_attended_user_id_raw = matched_uid_raw
-                                    current_attended_user_id_key = matched_uid_key
-                                    current_attended_user_ts = now
-                                    source = "doa-matched-user-attend-user"
-                                elif current_attended_user_id_key == matched_uid_key:
-                                    source = "doa-user-hold-attend-user"
-                                else:
-                                    furhat.attend(x, y, z)
-                                    source = "doa-matched-user"
-                            else:
-                                furhat.attend(x, y, z)
-                                source = "doa-matched-user"
+                            furhat.attend(x, y, z)
+                            source = "doa-matched-user"
                             last_doa_match_xyz = (x, y, z)
                             last_doa_match_ts = now
                         else:
@@ -520,20 +489,11 @@ def main():
                         active_doa_user_id = None
                         active_doa_user_hits = 0
                         age_ms = (now - last_doa_match_ts) * 1000.0
-                        hold_user_ms = (now - current_attended_user_ts) * 1000.0
-                        if (
-                            a.doa_user_final_attend_user
-                            and current_attended_user_id_raw is not None
-                            and hold_user_ms <= max(0, a.doa_user_hold_attend_user_ms)
-                        ):
-                            source = "doa-user-hold-attend-user"
-                        elif last_doa_match_xyz is not None and age_ms <= a.doa_user_hold_ms:
+                        if last_doa_match_xyz is not None and age_ms <= a.doa_user_hold_ms:
                             x, y, z = last_doa_match_xyz
                             furhat.attend(x, y, z)
                             source = "doa-match-hold"
                         else:
-                            current_attended_user_id_raw = None
-                            current_attended_user_id_key = None
                             furhat.attend(x, y, z)
                             source = "doa-fallback"
                 else:
