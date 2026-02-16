@@ -1,11 +1,27 @@
-# Minimal ReSpeaker DOA -> Furhat (Silero VAD)
+# ReSpeaker DOA + Furhat Tracker
 
-`doa_furhat.py` does only this:
-- gate audio with Silero VAD
-- estimate DOA azimuth from ReSpeaker raw 4-mic ring channels (SRP-PHAT in `srp_phat.py`)
-- send `request.attend.location` (`x,y,z`) to Furhat realtime WS API
+This project tracks speaking direction from a multi-channel microphone array and drives Furhat attention in real time.
 
-## Install
+Core files:
+- `doa_furhat.py`: main runtime loop (audio capture, VAD gating, DOA mapping, Furhat control).
+- `srp_phat.py`: SRP-PHAT azimuth estimator with a confidence score.
+
+## What It Does
+
+1. Captures multi-channel audio from a USB microphone array.
+2. Uses Silero VAD + energy/SNR gates to decide if speech is active.
+3. Estimates DOA azimuth from mic channels using SRP-PHAT.
+4. Maps azimuth to Furhat `request.attend.location` (`x,y,z`).
+5. Optionally combines DOA with Furhat user locations (`hybrid` / `doa-user-match`).
+
+## Requirements
+
+- Python 3.10+ (recommended)
+- A Furhat robot reachable over network
+- A multi-channel input device for DOA (minimum 4 input channels)
+- Packages in `requirements.txt`
+
+Install:
 
 ```powershell
 python -m venv .venv
@@ -13,53 +29,137 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Run
+## Quick Start
+
+Default run:
 
 ```powershell
-python doa_furhat.py
+.venv\Scripts\python.exe doa_furhat.py
 ```
 
-Soft/medium speech pickup (recommended starting point):
+Default mode is `doa-user-match`.
+
+## Main Run Modes
+
+- `location`: pure DOA-driven `attend.location`.
+- `closest-user`: repeatedly calls Furhat `attend.user` with `user_id=closest` (no DOA loop).
+- `hybrid`: DOA intent + camera users blend.
+- `doa-user-match` (default): DOA first, then tries matching DOA bearing to Furhat users; falls back to DOA location.
+
+Examples:
 
 ```powershell
-python doa_furhat.py --snr-speech-ratio 1.4 --snr-speech-add 20 --snr-update-ratio 1.7 --snr-update-add 35 --energy-threshold 80 --energy-update-threshold 140
+.venv\Scripts\python.exe doa_furhat.py --attend-mode location
+.venv\Scripts\python.exe doa_furhat.py --attend-mode hybrid
+.venv\Scripts\python.exe doa_furhat.py --attend-mode doa-user-match
 ```
 
-If auth key is enabled:
+## Current Defaults (Important)
+
+Audio and DOA:
+- `--fs 16000`
+- `--channels 6`
+- `--mic-channels 1,2,3,4`
+- `--frame-ms 80`
+- `--srp-az-step-deg 2.0`
+- `--srp-interp 4`
+- `--srp-f-low-hz 300`
+- `--srp-f-high-hz 3400`
+
+Speech gates:
+- `--vad-threshold 0.22`
+- `--vad-update-threshold 0.30`
+- `--energy-threshold 80`
+- `--energy-update-threshold 140`
+- `--snr-speech-ratio 1.4`
+- `--snr-speech-add 20`
+- `--snr-update-ratio 1.7`
+- `--snr-update-add 35`
+- `--speech-hold-ms 140`
+
+Mapping and motion:
+- `--board-zero-offset -45`
+- `--front-only` enabled
+- `--max-az-deg 60`
+- `--az-gain 0.70`
+- `--target-distance-m 1.2`
+- `--target-y-m 0.0`
+- `--flip-x` enabled
+
+Smoothing:
+- `--smooth-alpha 0.32`
+- `--lock-alpha 0.30`
+- `--min-consistent-updates 1`
+- `--consistency-deg 18`
+- `--speaker-switch-deg 25`
+- `--speaker-switch-updates 1`
+- `--doa-quality-threshold 0.15`
+- `--min-update-frames 1`
+- `--speech-hold-ms 140`
+
+## Device Selection
+
+By default, the script uses `--device 0`.
+
+If DOA does not respond, explicitly set device and channels:
 
 ```powershell
-python doa_furhat.py --furhat-ip 192.168.1.108 --furhat-auth-key "YOUR_KEY"
+.venv\Scripts\python.exe doa_furhat.py --device <INDEX> --channels 6 --mic-channels 1,2,3,4
 ```
 
-If you want to override defaults quickly:
+To list devices from Python:
 
 ```powershell
-python doa_furhat.py --furhat-ip 192.168.1.108 --board-zero-offset -45 --no-board-cw --flip-x
+.venv\Scripts\python.exe -c "import sounddevice as sd; print(sd.query_devices())"
 ```
 
-Hybrid mode (VAD trigger + DOA side intent + camera user location):
+Notes:
+- DOA requires a real multi-channel endpoint. Mono endpoints cannot estimate direction.
+- If you select a 4-channel endpoint, the script auto-adjusts channels and mic indices when possible.
+
+## Log Output
+
+When tracking:
+
+```text
+[track] mode=... src=... doa=... conf=... vad=... e=... az=... xyz=(x,y,z)
+```
+
+Meaning:
+- `doa`: raw SRP azimuth (degrees).
+- `conf`: SRP confidence from `srp_phat.py`.
+- `vad`: Silero speech probability.
+- `e`: mean absolute energy of the selected VAD mic channel.
+- `az`: smoothed/locked azimuth used for control.
+- `xyz`: target sent to Furhat.
+
+When idle:
+
+```text
+[idle] vad=... e=... noise=... gate=...
+```
+
+## Furhat Connection
+
+Defaults:
+- `--furhat-ip 192.168.1.108`
+- `--furhat-port 9000`
+- `--furhat-auth-key ""`
+
+If your Furhat requires auth:
 
 ```powershell
-python doa_furhat.py --attend-mode hybrid
+.venv\Scripts\python.exe doa_furhat.py --furhat-ip <FURHAT_IP> --furhat-auth-key "<KEY>"
 ```
 
-DOA-first + user-coordinate match mode:
+## Left/Right Calibration Tips
 
-```powershell
-python doa_furhat.py --attend-mode doa-user-match
-```
+- If left/right is mirrored: toggle `--flip-x` / `--no-flip-x`.
+- If board orientation differs: try `--board-cw` and `--board-zero-offset`.
+- If front/back appears inverted: try `--add-180`.
 
-SRP-PHAT tuning (optional):
+## What Is Not In This Version
 
-```powershell
-python doa_furhat.py --srp-az-step-deg 2.0 --srp-interp 4
-```
-
-## Notes
-
-- ReSpeaker raw setup provides azimuth, not elevation. `y` is fixed via `--target-y-m`.
-- If left/right is mirrored, toggle `--board-cw` vs `--no-board-cw`.
-- If still mirrored in user view, add `--flip-x`.
-- If front/back is opposite, add `--add-180`.
-- For one-user-in-front setup, keep `--front-only` and set `--max-az-deg` (e.g. 55-65).
-- If you want robust one-user following without DOA mapping ambiguity, use `--attend-mode closest-user` (still VAD-gated).
+- No `--audio-json` flag.
+- No debug JSON payload output from `doa_furhat.py`.
+- Confidence is the current SRP score from `srp_phat.py` (`0.5*sharpness + 0.5*contrast`), not a multi-term fusion metric.
