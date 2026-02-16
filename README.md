@@ -20,6 +20,12 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+For audio DOA + fusion runtime, also install:
+
+```bash
+./venv/bin/pip install -r audio_doa/requirements.txt
+```
+
 ## MediaPipe model (required for Step 3)
 
 Step 3 uses MediaPipe Tasks `FaceLandmarker` and requires a `.task` model file.
@@ -119,6 +125,36 @@ Optional small-face upsampling (improves distant faces):
 ```bash
 ./venv/bin/python scripts/step6_realtime_infer.py --upsample-small-faces
 ```
+
+## Live AV fusion (single command)
+
+This project now supports true realtime AV fusion with one command. It starts:
+
+- visual inference (`scripts/step6_realtime_infer.py`)
+- audio DOA (`audio_doa/doa_core.py`)
+- fusion + optional Furhat attend (`audio_doa/run_live_fusion.py`)
+
+Run:
+
+```bash
+./venv/bin/python audio_doa/run_live_fusion.py \
+  --furhat-ip 192.168.1.109 \
+  --attend-furhat \
+  --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 \
+  --step6-extra "--show --window-width 960 --window-height 540"
+```
+
+In the realtime window, each user bbox shows:
+
+- `c`: CNN score
+- `d`: DOA score for that user
+- `o`: overall fused score
+- `a`: active speaker flag (`1` active, `0` inactive)
+
+Color policy:
+
+- active speaker bbox = green
+- non-active fused users = orange
 
 ## Final run used (current best)
 

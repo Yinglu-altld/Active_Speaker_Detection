@@ -6,11 +6,14 @@ import time
 
 import numpy as np
 import sounddevice as sd
-import torch
 import websocket
-from silero_vad import load_silero_vad
 
-from srp_phat import SRPPhatDOA
+try:
+    from .doa_core import DOAConfig, DOAEstimator, SileroGate
+    from .srp_phat import SRPPhatDOA
+except ImportError:
+    from doa_core import DOAConfig, DOAEstimator, SileroGate
+    from srp_phat import SRPPhatDOA
 
 
 MIC_XY = np.array([[0.028, 0.0], [0.0, 0.028], [-0.028, 0.0], [0.0, -0.028]], dtype=np.float64)
@@ -24,22 +27,6 @@ def fold_front(az):
     if az > 90.0: return 180.0 - az
     if az < -90.0: return -180.0 - az
     return az
-
-
-class SileroGate:
-    def __init__(self, thr=0.55, sr=16000):
-        self.model, self.thr, self.sr = load_silero_vad(), thr, sr
-        if hasattr(self.model, "reset_states"): self.model.reset_states()
-
-    def speech(self, x_int16):
-        x = torch.from_numpy(x_int16.astype(np.float32) / 32768.0)
-        best = 0.0
-        for i in range(0, len(x), 512):
-            c = x[i:i + 512]
-            if len(c) < 512: c = torch.nn.functional.pad(c, (0, 512 - len(c)))
-            p = float(self.model(c, self.sr).item())
-            if p > best: best = p
-        return best >= self.thr, best
 
 
 class FurhatWS:
@@ -170,7 +157,7 @@ def user_location_xyz(user):
 
 def main():
     p = argparse.ArgumentParser(description="ReSpeaker raw DOA + Silero VAD -> Furhat attend.location")
-    p.add_argument("--furhat-ip", default="192.168.1.108")
+    p.add_argument("--furhat-ip", default="192.168.1.109")
     p.add_argument("--furhat-port", type=int, default=9000)
     p.add_argument("--furhat-auth-key", default="")
     p.add_argument("--fs", type=int, default=16000)
@@ -239,7 +226,6 @@ def main():
     if vad_mic < 0 or vad_mic >= len(idx):
         vad_mic = 0
     q = queue.Queue(maxsize=16)
-    vad = SileroGate(a.vad_threshold, a.fs)
     furhat = FurhatWS(
         a.furhat_ip,
         a.furhat_port,
@@ -257,6 +243,24 @@ def main():
         f_low_hz=a.srp_f_low_hz,
         f_high_hz=a.srp_f_high_hz,
     )
+    doa_cfg = DOAConfig(
+        fs=a.fs,
+        frame_ms=a.frame_ms,
+        vad_mic=vad_mic,
+        vad_threshold=a.vad_threshold,
+        vad_smooth_alpha=a.vad_smooth_alpha,
+        vad_update_threshold=a.vad_update_threshold,
+        energy_threshold=a.energy_threshold,
+        energy_update_threshold=a.energy_update_threshold,
+        noise_alpha=a.noise_alpha,
+        snr_speech_ratio=a.snr_speech_ratio,
+        snr_speech_add=a.snr_speech_add,
+        snr_update_ratio=a.snr_update_ratio,
+        snr_update_add=a.snr_update_add,
+        speech_hold_ms=a.speech_hold_ms,
+        doa_quality_threshold=a.doa_quality_threshold,
+    )
+    doa_est = DOAEstimator(doa_cfg, srp, SileroGate(a.vad_threshold, a.fs))
     sm_az = None
     locked_az = None
     pending_az = None
@@ -271,12 +275,7 @@ def main():
     last_users_once_ts = 0.0
     last_send = 0.0
     last_idle_log = 0.0
-    noise_e = None
-    vad_sm = None
     min_period = 1.0 / max(a.update_hz, 1e-3)
-    hold_frames = max(0, int(round(a.speech_hold_ms / max(a.frame_ms, 1))))
-    hold = 0
-    vad_update_thr = a.vad_threshold if a.vad_update_threshold is None else a.vad_update_threshold
     if a.attend_mode in ("hybrid", "closest-user", "doa-user-match"):
         furhat.start_users_stream()
 
@@ -307,22 +306,9 @@ def main():
             while True:
                 frame = q.get()
                 mics_i16 = frame[:, idx]
-                mics = mics_i16.astype(np.float32)
-                mono = np.ascontiguousarray(mics_i16[:, vad_mic])
-                speech_vad, vad_p = vad.speech(mono)
-                if vad_sm is None or float(a.vad_smooth_alpha) <= 0.0:
-                    vad_sm = float(vad_p)
-                else:
-                    aa = float(a.vad_smooth_alpha)
-                    vad_sm = aa * float(vad_sm) + (1.0 - aa) * float(vad_p)
-                energy = float(np.mean(np.abs(mono)))
-                if noise_e is None:
-                    noise_e = energy
-                speech_gate_e = max(float(a.energy_threshold), float(noise_e) * float(a.snr_speech_ratio) + float(a.snr_speech_add))
-                speech = (float(vad_sm) >= float(a.vad_threshold)) or (energy >= speech_gate_e)
-                prev_hold = hold
-                hold = hold_frames if speech else max(hold - 1, 0)
-                if prev_hold > 0 and hold == 0:
+                now = time.time()
+                obs = doa_est.process(mics_i16, now)
+                if obs.speech_ended:
                     locked_az = None
                     sm_az = None
                     pending_az = None
@@ -332,65 +318,56 @@ def main():
                     active_doa_user_hits = 0
                     last_doa_match_xyz = None
                     last_doa_match_ts = 0.0
-                    if hasattr(vad.model, "reset_states"):
-                        vad.model.reset_states()
-                if hold == 0:
-                    # Update noise floor only in non-speech periods.
-                    if float(vad_sm) < 0.15:
-                        na = float(a.noise_alpha)
-                        noise_e = na * float(noise_e) + (1.0 - na) * energy
-                    now = time.time()
+                if not obs.speech_active:
                     if now - last_idle_log >= 1.0:
-                        print(f"[idle] vad={float(vad_sm):4.2f} e={energy:6.1f} noise={float(noise_e):6.1f} gate={speech_gate_e:6.1f}")
+                        print(f"[idle] vad={float(obs.speech_prob):4.2f} e={obs.energy:6.1f} noise={float(obs.noise_energy):6.1f} gate={obs.speech_gate_energy:6.1f}")
                         last_idle_log = now
                     continue
 
                 doa = float("nan")
                 qd = float("nan")
                 doa_updated = False
-                update_gate_e = max(float(a.energy_update_threshold), float(noise_e) * float(a.snr_update_ratio) + float(a.snr_update_add))
-                allow_update = (float(vad_sm) >= float(vad_update_thr)) or (energy >= update_gate_e)
-                if speech and allow_update:
-                    out = srp.estimate(mics)
-                    if out is not None:
-                        doa, qd = out
-                        if qd >= a.doa_quality_threshold:
-                            doa_updated = True
-                            az1, az2 = map_doa_to_az(
-                                doa=doa,
-                                board_cw=a.board_cw,
-                                offset=a.board_zero_offset,
-                                add_180=a.add_180,
-                                front_only=a.front_only,
-                                max_az=a.max_az_deg,
-                            )
-                            ref = locked_az if locked_az is not None else (sm_az if sm_az is not None else 0.0)
-                            az_candidates = (az1, az2) if a.use_mirror_branch else (az1,)
-                            az = min(az_candidates, key=lambda t: abs(cdelta(ref, t)))
-                            if pending_az is None or abs(cdelta(pending_az, az)) > a.consistency_deg:
-                                pending_az = az
-                                pending_count = 1
-                            else:
-                                pending_az = cblend(pending_az, az, 0.5)
-                                pending_count += 1
+                if obs.doa_deg is not None:
+                    doa = float(obs.doa_deg)
+                if obs.doa_conf is not None:
+                    qd = float(obs.doa_conf)
+                doa_updated = bool(obs.doa_updated)
+                if doa_updated:
+                    az1, az2 = map_doa_to_az(
+                        doa=doa,
+                        board_cw=a.board_cw,
+                        offset=a.board_zero_offset,
+                        add_180=a.add_180,
+                        front_only=a.front_only,
+                        max_az=a.max_az_deg,
+                    )
+                    ref = locked_az if locked_az is not None else (sm_az if sm_az is not None else 0.0)
+                    az_candidates = (az1, az2) if a.use_mirror_branch else (az1,)
+                    az = min(az_candidates, key=lambda t: abs(cdelta(ref, t)))
+                    if pending_az is None or abs(cdelta(pending_az, az)) > a.consistency_deg:
+                        pending_az = az
+                        pending_count = 1
+                    else:
+                        pending_az = cblend(pending_az, az, 0.5)
+                        pending_count += 1
 
-                            if pending_count >= max(1, a.min_consistent_updates):
-                                if locked_az is None:
+                    if pending_count >= max(1, a.min_consistent_updates):
+                        if locked_az is None:
+                            locked_az = pending_az
+                            switch_count = 0
+                        else:
+                            jump = abs(cdelta(locked_az, pending_az))
+                            if jump <= a.max_jump_deg:
+                                locked_az = cblend(locked_az, pending_az, a.lock_alpha)
+                                switch_count = 0
+                            elif jump >= a.speaker_switch_deg:
+                                # New active speaker on another side: unlock after a few consistent updates.
+                                switch_count += 1
+                                if switch_count >= max(1, a.speaker_switch_updates):
                                     locked_az = pending_az
                                     switch_count = 0
-                                else:
-                                    jump = abs(cdelta(locked_az, pending_az))
-                                    if jump <= a.max_jump_deg:
-                                        locked_az = cblend(locked_az, pending_az, a.lock_alpha)
-                                        switch_count = 0
-                                    elif jump >= a.speaker_switch_deg:
-                                        # New active speaker on another side: unlock after a few consistent updates.
-                                        switch_count += 1
-                                        if switch_count >= max(1, a.speaker_switch_updates):
-                                            locked_az = pending_az
-                                            switch_count = 0
-                                    else:
-                                        switch_count = 0
+                            else:
+                                switch_count = 0
 
                 if sm_az is None:
                     if locked_az is not None:
@@ -532,7 +509,7 @@ def main():
                     furhat.attend(x, y, z)
                 last_send = time.time()
                 az_log = sm_az if sm_az is not None else float("nan")
-                print(f"[track] mode={a.attend_mode} src={source} doa={doa:7.2f} conf={qd:4.2f} vad={vad_p:4.2f} e={energy:6.1f} az={az_log:7.2f} xyz=({x:6.3f},{y:5.2f},{z:6.3f})")
+                print(f"[track] mode={a.attend_mode} src={source} doa={doa:7.2f} conf={qd:4.2f} vad={obs.vad_prob:4.2f} e={obs.energy:6.1f} az={az_log:7.2f} xyz=({x:6.3f},{y:5.2f},{z:6.3f})")
     except KeyboardInterrupt:
         print("\n[tracker] stopped.")
 

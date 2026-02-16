@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import os
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -26,6 +27,16 @@ DEFAULT_MODEL_DIR = PROJECT_ROOT / "data" / "models" / "cnn_vvad"
 DEFAULT_WINDOWS_INFO = PROJECT_ROOT / "data" / "windows" / "windows_info.json"
 DEFAULT_FURHAT_IP = "192.168.1.109"
 DEFAULT_FURHAT_AUTH = None
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    from audio_doa.fusion import FusionConfig, UserEvidence, score_users_for_frame
+except Exception:
+    FusionConfig = None
+    UserEvidence = None
+    score_users_for_frame = None
 
 
 @dataclass
@@ -54,6 +65,8 @@ class UserBox:
     y: int
     w: int
     h: int
+    location_x: float | None = None
+    location_z: float | None = None
 
 
 class FrameRateLimiter:
@@ -178,8 +191,46 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional threshold to turn speaking OFF (defaults to model threshold).",
     )
+    parser.add_argument(
+        "--emit-cnn-jsonl",
+        default=None,
+        help="Optional output path for fusion snapshots (JSONL).",
+    )
+    parser.add_argument(
+        "--camera-hfov-deg",
+        type=float,
+        default=60.0,
+        help="Approximate camera horizontal FOV for bbox-to-bearing mapping.",
+    )
+    parser.add_argument(
+        "--flip-cnn-bearing",
+        action="store_true",
+        help="Flip sign of estimated bearing before writing fusion JSONL.",
+    )
+    parser.add_argument(
+        "--doa-jsonl-live",
+        default=None,
+        help="Optional live DOA JSONL path for realtime fusion overlay in --show mode.",
+    )
+    parser.add_argument(
+        "--max-doa-staleness-sec",
+        type=float,
+        default=0.8,
+        help="Max |t_frame - t_doa| to accept DOA for fusion overlay.",
+    )
+    parser.add_argument("--fusion-low-conf-th", type=float, default=0.03)
+    parser.add_argument("--fusion-mid-conf-th", type=float, default=0.07)
+    parser.add_argument("--fusion-low-srp-th", type=float, default=0.08)
+    parser.add_argument("--fusion-low-audio-th", type=float, default=0.25)
+    parser.add_argument("--fusion-weak-doa-weight", type=float, default=0.10)
+    parser.add_argument("--fusion-mid-doa-weight", type=float, default=0.25)
+    parser.add_argument("--fusion-strong-doa-weight", type=float, default=0.40)
+    parser.add_argument("--fusion-default-sigma-deg", type=float, default=25.0)
+    parser.add_argument("--fusion-min-sigma-deg", type=float, default=8.0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--show", action="store_true")
+    parser.add_argument("--window-width", type=int, default=960)
+    parser.add_argument("--window-height", type=int, default=540)
     parser.add_argument(
         "--no-draw-landmarks",
         dest="draw_landmarks",
@@ -333,8 +384,23 @@ def draw_overlays(frame, outputs) -> None:
         prob_out = out["prob"]
         speak = out["speak"]
         bbox = out.get("bbox")
-        label = f"{track_id} {prob_out:.2f} {int(speak)}"
-        color = prob_color(prob_out)
+        overall = out.get("fusion_overall")
+        score_cnn = out.get("fusion_cnn")
+        score_doa = out.get("fusion_doa")
+        is_active = bool(out.get("active_speaker"))
+        if overall is None:
+            label = f"{track_id} cnn:{prob_out:.2f} speak:{int(speak)}"
+        else:
+            label = (
+                f"{track_id} c:{float(score_cnn):.2f} d:{float(score_doa):.2f} "
+                f"o:{float(overall):.2f} a:{int(is_active)}"
+            )
+        if is_active:
+            color = (0, 255, 0)
+        elif overall is not None:
+            color = (0, 165, 255)
+        else:
+            color = prob_color(prob_out)
         if bbox:
             x1, y1, x2, y2 = bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -420,6 +486,188 @@ def maybe_upsample_crop(
     return cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
 
+def location_to_bearing_deg(location_x: float | None, location_z: float | None) -> float | None:
+    if location_x is None or location_z is None:
+        return None
+    if abs(location_x) < 1e-6 and abs(location_z) < 1e-6:
+        return None
+    return float(np.degrees(np.arctan2(location_x, location_z)))
+
+
+def bbox_to_bearing_deg(
+    bbox: tuple[int, int, int, int] | None,
+    frame_width: int,
+    hfov_deg: float,
+) -> float | None:
+    if bbox is None or frame_width <= 1:
+        return None
+    x1, _, x2, _ = bbox
+    cx = 0.5 * (x1 + x2)
+    norm = (cx / float(frame_width)) - 0.5
+    return float(norm * float(hfov_deg))
+
+
+def estimate_user_bearing_deg(
+    user: UserBox,
+    bbox: tuple[int, int, int, int] | None,
+    frame_width: int,
+    hfov_deg: float,
+    flip: bool,
+) -> float | None:
+    bearing = location_to_bearing_deg(user.location_x, user.location_z)
+    if bearing is None:
+        bearing = bbox_to_bearing_deg(bbox, frame_width, hfov_deg)
+    if bearing is None:
+        return None
+    return float(-bearing if flip else bearing)
+
+
+def emit_cnn_snapshot(handle, t_value: float, outputs: list[dict]) -> None:
+    users = []
+    for out in outputs:
+        bearing = out.get("bearing_deg")
+        if bearing is None:
+            continue
+        users.append(
+            {
+                "user_id": str(out["track_id"]),
+                "bearing_deg": float(bearing),
+                "cnn_prob": float(out["prob"]),
+                "speak": bool(out["speak"]),
+                "face_conf": 1.0,
+                "track_conf": 1.0,
+            }
+        )
+    if not users:
+        return
+    handle.write(json.dumps({"t": float(t_value), "users": users}) + "\n")
+    handle.flush()
+
+
+class LiveDOASnapshots:
+    def __init__(self, path: str):
+        self.path = path
+        self.handle = None
+        self.offset = 0
+        self.latest = None
+
+    def _ensure_handle(self) -> None:
+        if self.handle is not None:
+            return
+        if not os.path.exists(self.path):
+            return
+        self.handle = open(self.path, "r", encoding="utf-8")
+        self.handle.seek(self.offset)
+
+    def poll(self) -> None:
+        if os.path.exists(self.path) and os.path.getsize(self.path) < self.offset:
+            if self.handle is not None:
+                self.handle.close()
+            self.handle = None
+            self.offset = 0
+            self.latest = None
+
+        self._ensure_handle()
+        if self.handle is None:
+            return
+
+        while True:
+            line = self.handle.readline()
+            if not line:
+                break
+            self.offset = self.handle.tell()
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                item = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            if item.get("t") is None:
+                continue
+            self.latest = item
+
+    def get_for_time(self, t_value: float, max_staleness_sec: float):
+        self.poll()
+        if self.latest is None:
+            return None
+        t_obs = self.latest.get("t")
+        if t_obs is None:
+            return None
+        if abs(float(t_value) - float(t_obs)) > float(max_staleness_sec):
+            return None
+        return self.latest
+
+
+class FusionOverlayRuntime:
+    def __init__(self, args: argparse.Namespace):
+        if score_users_for_frame is None or FusionConfig is None or UserEvidence is None:
+            raise ImportError(
+                "audio_doa.fusion is required for DOA fusion overlay. Ensure repo root is importable."
+            )
+        self.live_doa = LiveDOASnapshots(args.doa_jsonl_live)
+        self.max_staleness_sec = float(args.max_doa_staleness_sec)
+        self.cfg = FusionConfig(
+            min_sigma_deg=float(args.fusion_min_sigma_deg),
+            default_sigma_deg=float(args.fusion_default_sigma_deg),
+            weak_doa_weight=float(args.fusion_weak_doa_weight),
+            mid_doa_weight=float(args.fusion_mid_doa_weight),
+            strong_doa_weight=float(args.fusion_strong_doa_weight),
+            low_conf_th=float(args.fusion_low_conf_th),
+            mid_conf_th=float(args.fusion_mid_conf_th),
+            low_srp_th=float(args.fusion_low_srp_th),
+            low_audio_th=float(args.fusion_low_audio_th),
+        )
+
+    def annotate_outputs(self, outputs: list[dict], t_value: float) -> None:
+        if not outputs:
+            return
+        doa_obs = self.live_doa.get_for_time(t_value=t_value, max_staleness_sec=self.max_staleness_sec)
+        if doa_obs is None:
+            for out in outputs:
+                out["fusion_overall"] = None
+                out["fusion_cnn"] = float(out["prob"])
+                out["fusion_doa"] = 0.0
+                out["active_speaker"] = False
+            return
+
+        users = []
+        for out in outputs:
+            bearing_deg = out.get("bearing_deg")
+            if bearing_deg is None:
+                continue
+            users.append(
+                UserEvidence(
+                    user_id=str(out["track_id"]),
+                    bearing_deg=float(bearing_deg),
+                    cnn_prob=float(out["prob"]),
+                    face_conf=1.0,
+                    track_conf=1.0,
+                )
+            )
+
+        if not users:
+            return
+
+        result = score_users_for_frame(doa_obs=doa_obs, users=users, cfg=self.cfg)
+        score_map = {str(item["user_id"]): item for item in result.get("per_user", [])}
+        active_id = result.get("speaker_id")
+        for out in outputs:
+            row = score_map.get(str(out["track_id"]))
+            if row is None:
+                out["fusion_overall"] = None
+                out["fusion_cnn"] = float(out["prob"])
+                out["fusion_doa"] = 0.0
+                out["active_speaker"] = False
+                continue
+            out["fusion_overall"] = float(row["score"])
+            out["fusion_cnn"] = float(row["score_cnn"])
+            out["fusion_doa"] = float(row["score_doa"])
+            out["active_speaker"] = str(out["track_id"]) == str(active_id)
+
+
 def process_frame(
     frame: np.ndarray,
     landmarker,
@@ -433,6 +681,8 @@ def process_frame(
     limiter: FrameRateLimiter,
     print_state: dict,
     user_boxes: list[UserBox] | None,
+    cnn_jsonl_handle=None,
+    fusion_runtime: FusionOverlayRuntime | None = None,
 ) -> bool:
     now = time.time()
     if not limiter.should_process(now):
@@ -475,6 +725,7 @@ def process_frame(
                     args,
                     speak_on,
                     speak_off,
+                    None,
                     None,
                 )
             )
@@ -552,12 +803,32 @@ def process_frame(
                     speak_on,
                     speak_off,
                     (x1i, y1i, x2i, y2i),
+                    estimate_user_bearing_deg(
+                        user,
+                        (x1i, y1i, x2i, y2i),
+                        frame_w,
+                        args.camera_hfov_deg,
+                        args.flip_cnn_bearing,
+                    ),
                 )
             )
 
+    if fusion_runtime is not None and outputs:
+        fusion_runtime.annotate_outputs(outputs, now)
+
     if outputs:
         for out in outputs:
-            print(f"{out['track_id']} {out['prob']:.3f} {int(out['speak'])}")
+            if out.get("fusion_overall") is None:
+                print(f"{out['track_id']} {out['prob']:.3f} {int(out['speak'])}")
+            else:
+                print(
+                    f"{out['track_id']} cnn={float(out['fusion_cnn']):.3f} "
+                    f"doa={float(out['fusion_doa']):.3f} "
+                    f"overall={float(out['fusion_overall']):.3f} "
+                    f"active={int(bool(out.get('active_speaker')))}"
+                )
+        if cnn_jsonl_handle is not None:
+            emit_cnn_snapshot(cnn_jsonl_handle, now, outputs)
     elif args.show and int(now) != print_state["last_print"]:
         print_state["last_print"] = int(now)
         print("no face")
@@ -581,6 +852,7 @@ def update_track_state(
     speak_on: float,
     speak_off: float,
     bbox: tuple[int, int, int, int] | None = None,
+    bearing_deg: float | None = None,
 ) -> list[dict]:
     state = states.get(track_id)
     if state is None:
@@ -620,6 +892,7 @@ def update_track_state(
             "prob": float(prob_out),
             "speak": bool(state.is_speaking),
             "bbox": bbox,
+            "bearing_deg": bearing_deg,
         }
     ]
 
@@ -633,6 +906,8 @@ async def run_furhat_stream(
     oval_indices: list[int],
     device: torch.device,
     limiter: FrameRateLimiter,
+    cnn_jsonl_handle=None,
+    fusion_runtime: FusionOverlayRuntime | None = None,
 ) -> None:
     try:
         from furhat_realtime_api import AsyncFurhatClient, Events
@@ -684,6 +959,14 @@ async def run_furhat_stream(
             if not camera or not user_id:
                 continue
             try:
+                location = user.get("location") if isinstance(user, dict) else getattr(user, "location", None)
+                location_x = None
+                location_z = None
+                if isinstance(location, dict):
+                    if location.get("x") is not None:
+                        location_x = float(location.get("x"))
+                    if location.get("z") is not None:
+                        location_z = float(location.get("z"))
                 parsed.append(
                     UserBox(
                         user_id=str(user_id),
@@ -691,6 +974,8 @@ async def run_furhat_stream(
                         y=int(camera.get("y")),
                         w=int(camera.get("w")),
                         h=int(camera.get("h")),
+                        location_x=location_x,
+                        location_z=location_z,
                     )
                 )
             except Exception:
@@ -725,6 +1010,8 @@ async def run_furhat_stream(
                 limiter,
                 print_state,
                 latest_users,
+                cnn_jsonl_handle,
+                fusion_runtime,
             )
             if not keep_running:
                 break
@@ -779,56 +1066,76 @@ def main() -> None:
     )
 
     limiter = FrameRateLimiter(spec.target_fps)
-
-    with face_landmarker.FaceLandmarker.create_from_options(options) as landmarker:
-        if args.source == "furhat":
-            asyncio.run(
-                run_furhat_stream(
-                    args,
-                    spec,
-                    model,
-                    landmarker,
-                    image_module,
-                    oval_indices,
-                    device,
-                    limiter,
+    fusion_runtime = None
+    if args.doa_jsonl_live:
+        fusion_runtime = FusionOverlayRuntime(args)
+    if args.show:
+        cv2.namedWindow("vvad_realtime", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(
+            "vvad_realtime",
+            max(320, int(args.window_width)),
+            max(240, int(args.window_height)),
+        )
+    cnn_jsonl_handle = None
+    if args.emit_cnn_jsonl:
+        cnn_jsonl_handle = open(args.emit_cnn_jsonl, "a", encoding="utf-8", buffering=1)
+    try:
+        with face_landmarker.FaceLandmarker.create_from_options(options) as landmarker:
+            if args.source == "furhat":
+                asyncio.run(
+                    run_furhat_stream(
+                        args,
+                        spec,
+                        model,
+                        landmarker,
+                        image_module,
+                        oval_indices,
+                        device,
+                        limiter,
+                        cnn_jsonl_handle,
+                        fusion_runtime,
+                    )
                 )
-            )
-        else:
-            if args.source == "file":
-                if not args.video_file:
-                    raise ValueError("--video-file is required when --source=file")
-                source = args.video_file
-            elif args.source == "stream":
-                if not args.stream_url:
-                    raise ValueError("--stream-url is required when --source=stream")
-                source = args.stream_url
             else:
-                source = args.video_device
+                if args.source == "file":
+                    if not args.video_file:
+                        raise ValueError("--video-file is required when --source=file")
+                    source = args.video_file
+                elif args.source == "stream":
+                    if not args.stream_url:
+                        raise ValueError("--stream-url is required when --source=stream")
+                    source = args.stream_url
+                else:
+                    source = args.video_device
 
-            cap = StreamSource(source)
-            states: dict[str, TrackState] = {}
-            print_state = {"last_print": 0}
-            while True:
-                frame = cap.read()
-                if frame is None:
-                    break
-                if not process_frame(
-                    frame,
-                    landmarker,
-                    image_module,
-                    oval_indices,
-                    states,
-                    spec,
-                    model,
-                    device,
-                    args,
-                    limiter,
-                    print_state,
-                    None,
-                ):
-                    break
-            cap.release()
+                cap = StreamSource(source)
+                states: dict[str, TrackState] = {}
+                print_state = {"last_print": 0}
+                while True:
+                    frame = cap.read()
+                    if frame is None:
+                        break
+                    if not process_frame(
+                        frame,
+                        landmarker,
+                        image_module,
+                        oval_indices,
+                        states,
+                        spec,
+                        model,
+                        device,
+                        args,
+                        limiter,
+                        print_state,
+                        None,
+                        cnn_jsonl_handle,
+                        fusion_runtime,
+                    ):
+                        break
+                cap.release()
+    finally:
+        if cnn_jsonl_handle is not None:
+            cnn_jsonl_handle.close()
 
     if args.show:
         cv2.destroyAllWindows()
