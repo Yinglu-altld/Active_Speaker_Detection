@@ -177,6 +177,7 @@ def main():
     p.add_argument("--channels", type=int, default=6)
     p.add_argument("--device", type=int, default=0, help="sounddevice input device index")
     p.add_argument("--mic-channels", default="1,2,3,4", help="0-based indices inside capture stream")
+    p.add_argument("--vad-mic", type=int, default=0, help="index within --mic-channels used for VAD/energy (0..N-1)")
     p.add_argument("--frame-ms", type=int, default=80)
     p.add_argument("--srp-az-step-deg", type=float, default=2.0)
     p.add_argument("--srp-interp", type=int, default=4)
@@ -186,26 +187,32 @@ def main():
     p.add_argument("--board-cw", action="store_true", default=False)
     p.add_argument("--no-board-cw", action="store_false", dest="board_cw")
     p.add_argument("--add-180", action="store_true", help="add 180 deg to DOA mapping")
-    p.add_argument("--attend-mode", choices=("location", "closest-user", "hybrid", "doa-user-match"), default="location")
-    p.add_argument("--smooth-alpha", type=float, default=0.30)
-    p.add_argument("--lock-alpha", type=float, default=0.22, help="update rate for locked azimuth during one speech segment")
-    p.add_argument("--max-jump-deg", type=float, default=120.0)
-    p.add_argument("--speaker-switch-deg", type=float, default=45.0, help="force switch lock if candidate stays this far from current lock")
+    p.add_argument("--attend-mode", choices=("location", "closest-user", "hybrid", "doa-user-match"), default="doa-user-match")
+    p.add_argument("--smooth-alpha", type=float, default=0.18)
+    p.add_argument("--lock-alpha", type=float, default=0.14, help="update rate for locked azimuth during one speech segment")
+    p.add_argument("--max-jump-deg", type=float, default=90.0)
+    p.add_argument("--speaker-switch-deg", type=float, default=40.0, help="force switch lock if candidate stays this far from current lock")
     p.add_argument("--speaker-switch-updates", type=int, default=2, help="consistent far-apart updates needed to force speaker switch")
-    p.add_argument("--consistency-deg", type=float, default=25.0, help="max azimuth spread for consistent DOA updates")
+    p.add_argument("--consistency-deg", type=float, default=10.0, help="max azimuth spread for consistent DOA updates")
     p.add_argument("--min-consistent-updates", type=int, default=3, help="required consistent DOA updates before lock update")
-    p.add_argument("--doa-quality-threshold", type=float, default=0.15)
-    p.add_argument("--vad-threshold", type=float, default=0.18)
-    p.add_argument("--vad-update-threshold", type=float, default=0.25, help="minimum VAD prob required to update DOA")
-    p.add_argument("--energy-threshold", type=float, default=220.0, help="fallback speech gate on mean abs mono int16")
-    p.add_argument("--energy-update-threshold", type=float, default=150.0, help="fallback update gate when VAD is uncertain")
-    p.add_argument("--speech-hold-ms", type=int, default=600, help="continue tracking this long after VAD drops")
+    p.add_argument("--doa-quality-threshold", type=float, default=0.20)
+    p.add_argument("--vad-threshold", type=float, default=0.22)
+    p.add_argument("--vad-smooth-alpha", type=float, default=0.80, help="EMA alpha for VAD prob (0 disables smoothing)")
+    p.add_argument("--vad-update-threshold", type=float, default=0.30, help="minimum VAD prob required to update DOA")
+    p.add_argument("--energy-threshold", type=float, default=150.0, help="fallback speech gate on mean abs mono int16")
+    p.add_argument("--energy-update-threshold", type=float, default=250.0, help="fallback update gate when VAD is uncertain")
+    p.add_argument("--noise-alpha", type=float, default=0.97, help="EMA factor for noise floor energy estimate (higher = slower)")
+    p.add_argument("--snr-speech-ratio", type=float, default=1.8, help="speech gate: energy >= noise*ratio + add")
+    p.add_argument("--snr-speech-add", type=float, default=35.0, help="speech gate: energy >= noise*ratio + add")
+    p.add_argument("--snr-update-ratio", type=float, default=2.2, help="update gate (when VAD low): energy >= noise*ratio + add")
+    p.add_argument("--snr-update-add", type=float, default=60.0, help="update gate (when VAD low): energy >= noise*ratio + add")
+    p.add_argument("--speech-hold-ms", type=int, default=300, help="continue tracking this long after VAD drops")
     p.add_argument("--front-only", action="store_true", default=True)
     p.add_argument("--no-front-only", action="store_false", dest="front_only")
     p.add_argument("--use-mirror-branch", action="store_true", default=False, help="use mirrored azimuth candidate (legacy behavior)")
     p.add_argument("--max-az-deg", type=float, default=60.0)
-    p.add_argument("--az-gain", type=float, default=0.55, help="scale commanded azimuth to reduce over-tilt at extremes")
-    p.add_argument("--target-distance-m", type=float, default=1.8)
+    p.add_argument("--az-gain", type=float, default=0.70, help="scale commanded azimuth to reduce over-tilt at extremes")
+    p.add_argument("--target-distance-m", type=float, default=1.2)
     p.add_argument("--target-y-m", type=float, default=0.0)
     p.add_argument("--flip-x", action="store_true", default=True, help="mirror left/right by negating x")
     p.add_argument("--no-flip-x", action="store_false", dest="flip_x")
@@ -220,7 +227,7 @@ def main():
     p.add_argument("--doa-user-min-z", type=float, default=0.35, help="ignore users closer than this distance (m)")
     p.add_argument("--doa-user-max-z", type=float, default=2.50, help="ignore users farther than this distance (m)")
     p.add_argument("--doa-user-side-threshold-m", type=float, default=0.08, help="minimum |x| to compare DOA/user left-right side")
-    p.add_argument("--update-hz", type=float, default=8.0)
+    p.add_argument("--update-hz", type=float, default=6.0)
     p.add_argument("--attend-speed", default="medium")
     p.add_argument("--slack-pitch", type=float, default=15.0)
     p.add_argument("--slack-yaw", type=float, default=10.0)
@@ -228,6 +235,9 @@ def main():
     a = p.parse_args()
 
     idx = [int(s.strip()) for s in a.mic_channels.split(",")]
+    vad_mic = int(a.vad_mic)
+    if vad_mic < 0 or vad_mic >= len(idx):
+        vad_mic = 0
     q = queue.Queue(maxsize=16)
     vad = SileroGate(a.vad_threshold, a.fs)
     furhat = FurhatWS(
@@ -260,6 +270,9 @@ def main():
     active_doa_user_hits = 0
     last_users_once_ts = 0.0
     last_send = 0.0
+    last_idle_log = 0.0
+    noise_e = None
+    vad_sm = None
     min_period = 1.0 / max(a.update_hz, 1e-3)
     hold_frames = max(0, int(round(a.speech_hold_ms / max(a.frame_ms, 1))))
     hold = 0
@@ -293,11 +306,20 @@ def main():
             print("[tracker] running. Ctrl+C to stop.")
             while True:
                 frame = q.get()
-                mics = frame[:, idx].astype(np.float32)
-                mono = np.mean(mics, axis=1).astype(np.int16)
+                mics_i16 = frame[:, idx]
+                mics = mics_i16.astype(np.float32)
+                mono = np.ascontiguousarray(mics_i16[:, vad_mic])
                 speech_vad, vad_p = vad.speech(mono)
+                if vad_sm is None or float(a.vad_smooth_alpha) <= 0.0:
+                    vad_sm = float(vad_p)
+                else:
+                    aa = float(a.vad_smooth_alpha)
+                    vad_sm = aa * float(vad_sm) + (1.0 - aa) * float(vad_p)
                 energy = float(np.mean(np.abs(mono)))
-                speech = speech_vad or (energy >= a.energy_threshold)
+                if noise_e is None:
+                    noise_e = energy
+                speech_gate_e = max(float(a.energy_threshold), float(noise_e) * float(a.snr_speech_ratio) + float(a.snr_speech_add))
+                speech = (float(vad_sm) >= float(a.vad_threshold)) or (energy >= speech_gate_e)
                 prev_hold = hold
                 hold = hold_frames if speech else max(hold - 1, 0)
                 if prev_hold > 0 and hold == 0:
@@ -312,12 +334,22 @@ def main():
                     last_doa_match_ts = 0.0
                     if hasattr(vad.model, "reset_states"):
                         vad.model.reset_states()
-                if hold == 0: continue
+                if hold == 0:
+                    # Update noise floor only in non-speech periods.
+                    if float(vad_sm) < 0.15:
+                        na = float(a.noise_alpha)
+                        noise_e = na * float(noise_e) + (1.0 - na) * energy
+                    now = time.time()
+                    if now - last_idle_log >= 1.0:
+                        print(f"[idle] vad={float(vad_sm):4.2f} e={energy:6.1f} noise={float(noise_e):6.1f} gate={speech_gate_e:6.1f}")
+                        last_idle_log = now
+                    continue
 
                 doa = float("nan")
                 qd = float("nan")
                 doa_updated = False
-                allow_update = (vad_p >= vad_update_thr) or (energy >= a.energy_update_threshold)
+                update_gate_e = max(float(a.energy_update_threshold), float(noise_e) * float(a.snr_update_ratio) + float(a.snr_update_add))
+                allow_update = (float(vad_sm) >= float(vad_update_thr)) or (energy >= update_gate_e)
                 if speech and allow_update:
                     out = srp.estimate(mics)
                     if out is not None:
@@ -500,7 +532,7 @@ def main():
                     furhat.attend(x, y, z)
                 last_send = time.time()
                 az_log = sm_az if sm_az is not None else float("nan")
-                print(f"[track] mode={a.attend_mode} src={source} doa={doa:7.2f} q={qd:4.2f} vad={vad_p:4.2f} e={energy:6.1f} az={az_log:7.2f} xyz=({x:6.3f},{y:5.2f},{z:6.3f})")
+                print(f"[track] mode={a.attend_mode} src={source} doa={doa:7.2f} conf={qd:4.2f} vad={vad_p:4.2f} e={energy:6.1f} az={az_log:7.2f} xyz=({x:6.3f},{y:5.2f},{z:6.3f})")
     except KeyboardInterrupt:
         print("\n[tracker] stopped.")
 

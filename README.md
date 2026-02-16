@@ -19,6 +19,12 @@ pip install -r requirements.txt
 python doa_furhat.py
 ```
 
+Soft/medium speech pickup (recommended starting point):
+
+```powershell
+python doa_furhat.py --snr-speech-ratio 1.4 --snr-speech-add 20 --snr-update-ratio 1.7 --snr-update-add 35 --energy-threshold 80 --energy-update-threshold 140
+```
+
 If auth key is enabled:
 
 ```powershell
