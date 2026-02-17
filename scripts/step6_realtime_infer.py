@@ -377,7 +377,61 @@ def prob_color(prob: float) -> tuple[int, int, int]:
     return (0, 255, 0)
 
 
-def draw_overlays(frame, outputs) -> None:
+def _fmt_float(value) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _draw_status_hud(frame, hud: dict | None) -> None:
+    if not hud:
+        return
+    mode = str(hud.get("mode", "UNKNOWN"))
+    speech_active = bool(hud.get("speech_active", False))
+    face_count = int(hud.get("face_count", 0))
+    speaker_id = hud.get("speaker_id")
+    speaker_score = hud.get("speaker_score")
+    doa = hud.get("doa") or {}
+    azimuth = doa.get("azimuth_deg")
+    reliability = doa.get("reliability")
+    conf_geom = doa.get("conf_doa_srp")
+    audio_conf = doa.get("audio_conf")
+    sigma_deg = doa.get("sigma_deg")
+
+    lines = [
+        (
+            f"mode:{mode} speech:{int(speech_active)} faces:{face_count} "
+            f"speaker:{speaker_id if speaker_id is not None else '-'} "
+            f"score:{_fmt_float(speaker_score)}"
+        ),
+        (
+            f"doa az:{_fmt_float(azimuth)} rel:{_fmt_float(reliability)} "
+            f"geom:{_fmt_float(conf_geom)} audio:{_fmt_float(audio_conf)} "
+            f"sigma:{_fmt_float(sigma_deg)}"
+        ),
+    ]
+    box_h = 22 * len(lines) + 12
+    cv2.rectangle(frame, (8, 8), (frame.shape[1] - 8, 8 + box_h), (20, 20, 20), -1)
+    y = 30
+    for line in lines:
+        cv2.putText(
+            frame,
+            line,
+            (16, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (255, 255, 255),
+            2,
+            lineType=cv2.LINE_AA,
+        )
+        y += 22
+
+
+def draw_overlays(frame, outputs, hud: dict | None = None) -> None:
+    _draw_status_hud(frame, hud)
     y = 24
     for out in outputs:
         track_id = out["track_id"]
@@ -388,14 +442,17 @@ def draw_overlays(frame, outputs) -> None:
         score_cnn = out.get("fusion_cnn")
         score_doa = out.get("fusion_doa")
         is_active = bool(out.get("active_speaker"))
+        no_speech = bool(out.get("no_speech"))
         if overall is None:
-            label = f"{track_id} cnn:{prob_out:.2f} speak:{int(speak)}"
+            label = f"{track_id} cnn:{prob_out:.2f} speak:{int(speak)} ns:{int(no_speech)}"
         else:
             label = (
                 f"{track_id} c:{float(score_cnn):.2f} d:{float(score_doa):.2f} "
-                f"o:{float(overall):.2f} a:{int(is_active)}"
+                f"o:{float(overall):.2f} a:{int(is_active)} ns:{int(no_speech)}"
             )
-        if is_active:
+        if no_speech:
+            color = (0, 0, 255)
+        elif is_active:
             color = (0, 255, 0)
         elif overall is not None:
             color = (0, 165, 255)
@@ -621,17 +678,43 @@ class FusionOverlayRuntime:
             low_audio_th=float(args.fusion_low_audio_th),
         )
 
-    def annotate_outputs(self, outputs: list[dict], t_value: float) -> None:
-        if not outputs:
-            return
+    def annotate_outputs(self, outputs: list[dict], t_value: float) -> dict:
         doa_obs = self.live_doa.get_for_time(t_value=t_value, max_staleness_sec=self.max_staleness_sec)
+        hud = {
+            "mode": "DOA_MISSING" if doa_obs is None else "SPEECH_AV",
+            "speech_active": False if doa_obs is None else bool(doa_obs.get("speech_active") or doa_obs.get("speech_detected")),
+            "face_count": len(outputs),
+            "speaker_id": None,
+            "speaker_score": None,
+            "weights": {"cnn": 1.0, "doa": 0.0},
+            "doa": {
+                "azimuth_deg": None if doa_obs is None else doa_obs.get("azimuth_deg"),
+                "conf_doa_srp": None if doa_obs is None else doa_obs.get("conf_doa_srp"),
+                "audio_conf": None if doa_obs is None else doa_obs.get("audio_conf"),
+                "sigma_deg": None if doa_obs is None else doa_obs.get("sigma_deg"),
+                "reliability": None if doa_obs is None else 0.6 * float(doa_obs.get("conf_doa_srp") or 0.0) + 0.4 * float(doa_obs.get("audio_conf") or 0.0),
+            },
+        }
+
         if doa_obs is None:
             for out in outputs:
                 out["fusion_overall"] = None
                 out["fusion_cnn"] = float(out["prob"])
                 out["fusion_doa"] = 0.0
                 out["active_speaker"] = False
-            return
+                out["no_speech"] = False
+            return hud
+
+        speech_active = bool(doa_obs.get("speech_active") or doa_obs.get("speech_detected"))
+        if not speech_active:
+            hud["mode"] = "NO_SPEECH"
+            for out in outputs:
+                out["fusion_overall"] = None
+                out["fusion_cnn"] = float(out["prob"])
+                out["fusion_doa"] = 0.0
+                out["active_speaker"] = False
+                out["no_speech"] = True
+            return hud
 
         users = []
         for out in outputs:
@@ -649,9 +732,25 @@ class FusionOverlayRuntime:
             )
 
         if not users:
-            return
+            hud["mode"] = "SPEECH_CNN_ONLY"
+            if outputs:
+                top = max(outputs, key=lambda item: float(item["prob"]))
+                hud["speaker_id"] = str(top["track_id"])
+                hud["speaker_score"] = float(top["prob"])
+            for out in outputs:
+                out["fusion_overall"] = None
+                out["fusion_cnn"] = float(out["prob"])
+                out["fusion_doa"] = 0.0
+                out["active_speaker"] = False
+                out["no_speech"] = False
+            return hud
 
         result = score_users_for_frame(doa_obs=doa_obs, users=users, cfg=self.cfg)
+        hud["mode"] = "SPEECH_AV"
+        hud["speaker_id"] = result.get("speaker_id")
+        hud["speaker_score"] = result.get("speaker_score")
+        hud["weights"] = result.get("weights", hud["weights"])
+        hud["doa"] = result.get("doa", hud["doa"])
         score_map = {str(item["user_id"]): item for item in result.get("per_user", [])}
         active_id = result.get("speaker_id")
         for out in outputs:
@@ -661,11 +760,14 @@ class FusionOverlayRuntime:
                 out["fusion_cnn"] = float(out["prob"])
                 out["fusion_doa"] = 0.0
                 out["active_speaker"] = False
+                out["no_speech"] = False
                 continue
             out["fusion_overall"] = float(row["score"])
             out["fusion_cnn"] = float(row["score_cnn"])
             out["fusion_doa"] = float(row["score_doa"])
             out["active_speaker"] = str(out["track_id"]) == str(active_id)
+            out["no_speech"] = False
+        return hud
 
 
 def process_frame(
@@ -813,8 +915,9 @@ def process_frame(
                 )
             )
 
-    if fusion_runtime is not None and outputs:
-        fusion_runtime.annotate_outputs(outputs, now)
+    hud = None
+    if fusion_runtime is not None:
+        hud = fusion_runtime.annotate_outputs(outputs, now)
 
     if outputs:
         for out in outputs:
@@ -834,7 +937,7 @@ def process_frame(
         print("no face")
 
     if args.show:
-        draw_overlays(frame, outputs)
+        draw_overlays(frame, outputs, hud)
         cv2.imshow("vvad_realtime", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             return False

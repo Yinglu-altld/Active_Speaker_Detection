@@ -183,15 +183,17 @@ class DOAEstimator:
             if out is not None:
                 doa_deg = float(out.doa_deg)
                 doa_conf_srp = float(out.conf)
-                doa_conf = float(doa_conf_srp * audio_conf)
+                # Keep geometry confidence separate from audio reliability.
+                doa_conf = float(doa_conf_srp)
                 doa_sigma = out.sigma_deg
                 doa_entropy = float(out.entropy)
                 doa_conf_components = dict(out.conf_components)
+                doa_conf_components["geom_conf"] = float(doa_conf_srp)
                 doa_conf_components["audio_conf"] = float(audio_conf)
                 doa_conf_components["vad_conf"] = float(vad_conf)
                 doa_conf_components["snr_conf"] = float(snr_conf)
                 doa_peaks = out.peaks
-                if doa_conf >= float(self.cfg.doa_quality_threshold):
+                if doa_conf_srp >= float(self.cfg.doa_quality_threshold):
                     doa_updated = True
 
         if not speech_active and float(self.vad_sm) < 0.15:
