@@ -172,13 +172,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print compact text lines instead of full JSON.",
     )
-    parser.add_argument("--low-conf-th", type=float, default=0.03)
-    parser.add_argument("--mid-conf-th", type=float, default=0.07)
-    parser.add_argument("--low-srp-th", type=float, default=0.08)
-    parser.add_argument("--low-audio-th", type=float, default=0.25)
-    parser.add_argument("--weak-doa-weight", type=float, default=0.10)
-    parser.add_argument("--mid-doa-weight", type=float, default=0.25)
-    parser.add_argument("--strong-doa-weight", type=float, default=0.40)
     parser.add_argument("--default-sigma-deg", type=float, default=25.0)
     parser.add_argument("--min-sigma-deg", type=float, default=8.0)
     parser.add_argument("--attend-furhat", action="store_true")
@@ -327,13 +320,7 @@ def main() -> None:
     cfg = FusionConfig(
         min_sigma_deg=float(args.min_sigma_deg),
         default_sigma_deg=float(args.default_sigma_deg),
-        weak_doa_weight=float(args.weak_doa_weight),
-        mid_doa_weight=float(args.mid_doa_weight),
-        strong_doa_weight=float(args.strong_doa_weight),
-        low_conf_th=float(args.low_conf_th),
-        mid_conf_th=float(args.mid_conf_th),
-        low_srp_th=float(args.low_srp_th),
-        low_audio_th=float(args.low_audio_th),
+        fixed_doa_weight=0.35,
     )
     static_users = _parse_static_users(args.users)
     cnn_snapshots = _read_cnn_snapshots(args.cnn_jsonl)

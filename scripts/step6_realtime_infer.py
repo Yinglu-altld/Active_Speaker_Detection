@@ -218,13 +218,6 @@ def parse_args() -> argparse.Namespace:
         default=0.8,
         help="Max |t_frame - t_doa| to accept DOA for fusion overlay.",
     )
-    parser.add_argument("--fusion-low-conf-th", type=float, default=0.03)
-    parser.add_argument("--fusion-mid-conf-th", type=float, default=0.07)
-    parser.add_argument("--fusion-low-srp-th", type=float, default=0.08)
-    parser.add_argument("--fusion-low-audio-th", type=float, default=0.25)
-    parser.add_argument("--fusion-weak-doa-weight", type=float, default=0.10)
-    parser.add_argument("--fusion-mid-doa-weight", type=float, default=0.25)
-    parser.add_argument("--fusion-strong-doa-weight", type=float, default=0.40)
     parser.add_argument("--fusion-default-sigma-deg", type=float, default=25.0)
     parser.add_argument("--fusion-min-sigma-deg", type=float, default=8.0)
     parser.add_argument("--device", default="cpu")
@@ -669,13 +662,7 @@ class FusionOverlayRuntime:
         self.cfg = FusionConfig(
             min_sigma_deg=float(args.fusion_min_sigma_deg),
             default_sigma_deg=float(args.fusion_default_sigma_deg),
-            weak_doa_weight=float(args.fusion_weak_doa_weight),
-            mid_doa_weight=float(args.fusion_mid_doa_weight),
-            strong_doa_weight=float(args.fusion_strong_doa_weight),
-            low_conf_th=float(args.fusion_low_conf_th),
-            mid_conf_th=float(args.fusion_mid_conf_th),
-            low_srp_th=float(args.fusion_low_srp_th),
-            low_audio_th=float(args.fusion_low_audio_th),
+            fixed_doa_weight=0.35,
         )
 
     def annotate_outputs(self, outputs: list[dict], t_value: float) -> dict:

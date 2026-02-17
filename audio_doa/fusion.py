@@ -30,30 +30,7 @@ class UserEvidence:
 class FusionConfig:
     min_sigma_deg: float = 8.0
     default_sigma_deg: float = 25.0
-    weak_doa_weight: float = 0.10
-    mid_doa_weight: float = 0.25
-    strong_doa_weight: float = 0.40
-    low_conf_th: float = 0.03
-    mid_conf_th: float = 0.07
-    low_srp_th: float = 0.08
-    low_audio_th: float = 0.25
-    geom_weight: float = 0.60
-    audio_weight: float = 0.40
-
-
-def doa_reliability(conf_doa_srp: float, audio_conf: float, cfg: FusionConfig) -> float:
-    return _clip01(
-        float(cfg.geom_weight) * _clip01(conf_doa_srp)
-        + float(cfg.audio_weight) * _clip01(audio_conf)
-    )
-
-
-def doa_weight(reliability: float, cfg: FusionConfig) -> float:
-    base = _clip01(float(cfg.weak_doa_weight))
-    max_w = _clip01(float(cfg.strong_doa_weight))
-    if max_w < base:
-        max_w = base
-    return float(base + (max_w - base) * _clip01(reliability))
+    fixed_doa_weight: float = 0.35
 
 
 def _cnn_score(user: UserEvidence) -> float:
@@ -62,7 +39,6 @@ def _cnn_score(user: UserEvidence) -> float:
 
 def _doa_score(
     azimuth_deg: float | None,
-    reliability: float,
     sigma_deg: float | None,
     user_bearing_deg: float,
     cfg: FusionConfig,
@@ -72,7 +48,7 @@ def _doa_score(
     sigma = cfg.default_sigma_deg if sigma_deg is None else max(cfg.min_sigma_deg, float(sigma_deg))
     delta = _angle_diff_deg(float(azimuth_deg), float(user_bearing_deg))
     align = math.exp(-0.5 * (delta / sigma) ** 2)
-    return float(reliability) * align, delta
+    return float(align), delta
 
 
 def score_users_cnn_only(
@@ -121,8 +97,8 @@ def score_users_for_frame(
     conf_doa = _clip01(float(doa_obs.get("conf_doa") or 0.0))
     conf_doa_srp = _clip01(float(doa_obs.get("conf_doa_srp") or 0.0))
     audio_conf = _clip01(float(doa_obs.get("audio_conf") or 0.0))
-    reliability = doa_reliability(conf_doa_srp, audio_conf, cfg)
-    w_doa = doa_weight(reliability, cfg)
+    reliability = _clip01(0.6 * conf_doa_srp + 0.4 * audio_conf)
+    w_doa = _clip01(float(cfg.fixed_doa_weight))
     w_cnn = 1.0 - w_doa
 
     per_user = []
@@ -130,7 +106,6 @@ def score_users_for_frame(
         s_cnn = _cnn_score(user)
         s_doa, delta_deg = _doa_score(
             azimuth_deg=float(azimuth_deg) if azimuth_deg is not None else None,
-            reliability=reliability,
             sigma_deg=float(sigma_deg) if sigma_deg is not None else None,
             user_bearing_deg=float(user.bearing_deg),
             cfg=cfg,

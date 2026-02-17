@@ -24,6 +24,14 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Default DOA->Furhat calibration (kept internal on purpose, no CLI flags).
+# Mirrors prior doa_furhat behavior to avoid left/right inversion on ReSpeaker setup.
+DOA_AZ_OFFSET_DEG = -45.0
+DOA_AZ_GAIN = 0.70
+DOA_MAX_AZ_DEG = 60.0
+DOA_FRONT_ONLY = True
+DOA_FLIP_X = True
+
 
 class FurhatWS:
     def __init__(
@@ -199,13 +207,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--json-output", action="store_true")
 
-    parser.add_argument("--low-conf-th", type=float, default=0.03)
-    parser.add_argument("--mid-conf-th", type=float, default=0.07)
-    parser.add_argument("--low-srp-th", type=float, default=0.08)
-    parser.add_argument("--low-audio-th", type=float, default=0.25)
-    parser.add_argument("--weak-doa-weight", type=float, default=0.10)
-    parser.add_argument("--mid-doa-weight", type=float, default=0.25)
-    parser.add_argument("--strong-doa-weight", type=float, default=0.40)
     parser.add_argument("--default-sigma-deg", type=float, default=25.0)
     parser.add_argument("--min-sigma-deg", type=float, default=8.0)
 
@@ -282,6 +283,28 @@ def _clip01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def _wrap_deg(angle_deg: float) -> float:
+    return ((float(angle_deg) + 180.0) % 360.0) - 180.0
+
+
+def _fold_front(angle_deg: float) -> float:
+    angle = _wrap_deg(angle_deg)
+    if angle > 90.0:
+        return 180.0 - angle
+    if angle < -90.0:
+        return -180.0 - angle
+    return angle
+
+
+def _calibrate_doa_deg(azimuth_deg: float) -> float:
+    angle = _wrap_deg(float(azimuth_deg) + float(DOA_AZ_OFFSET_DEG))
+    if DOA_FRONT_ONLY:
+        angle = _fold_front(angle)
+    angle *= float(DOA_AZ_GAIN)
+    lim = abs(float(DOA_MAX_AZ_DEG))
+    return max(-lim, min(lim, angle))
+
+
 def _doa_reliability(doa_obs: dict) -> float:
     conf_srp = _clip01(float(doa_obs.get("conf_doa_srp") or 0.0))
     audio_conf = _clip01(float(doa_obs.get("audio_conf") or 0.0))
@@ -314,8 +337,11 @@ def _obs_speech_active(doa_obs: dict | None) -> bool:
 
 
 def _azimuth_to_xyz(azimuth_deg: float, distance_m: float, y_m: float) -> tuple[float, float, float]:
-    ang = math.radians(float(azimuth_deg))
+    az_cmd = _calibrate_doa_deg(float(azimuth_deg))
+    ang = math.radians(az_cmd)
     x = float(distance_m * math.sin(ang))
+    if DOA_FLIP_X:
+        x = -x
     z = float(distance_m * math.cos(ang))
     y = float(y_m)
     return x, y, z
@@ -450,13 +476,7 @@ def main() -> None:
     cfg = FusionConfig(
         min_sigma_deg=float(args.min_sigma_deg),
         default_sigma_deg=float(args.default_sigma_deg),
-        weak_doa_weight=float(args.weak_doa_weight),
-        mid_doa_weight=float(args.mid_doa_weight),
-        strong_doa_weight=float(args.strong_doa_weight),
-        low_conf_th=float(args.low_conf_th),
-        mid_conf_th=float(args.mid_conf_th),
-        low_srp_th=float(args.low_srp_th),
-        low_audio_th=float(args.low_audio_th),
+        fixed_doa_weight=0.35,
     )
 
     cnn_path = Path(args.cnn_jsonl_live)
