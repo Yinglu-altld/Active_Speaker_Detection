@@ -7,14 +7,23 @@ venv/
 .venv/
 
 # Data artifacts (large / generated)
-data/
+data/*
+!data/models/
+data/models/*
+!data/models/cnn_vvad/
+data/models/cnn_vvad/*
+!data/models/cnn_vvad/best.pt
+!data/models/cnn_vvad/config.json
+!data/models/cnn_vvad/threshold.json
+!data/models/face_landmarker_v2.task
+!data/windows/
+data/windows/*
+!data/windows/windows_info.json
 data/videos/
 data/labels/
 data/crops/
 data/landmarks/
-data/windows/
 data/.mplconfig/
-data/models/*.task
 
 # OS/editor
 .vscode/

@@ -1,0 +1,17 @@
+{
+  "npz": "/Users/luying/FurhatProjects/CNN+MediaPipe/data/windows/windows.npz",
+  "meta_csv": "/Users/luying/FurhatProjects/CNN+MediaPipe/data/windows/windows_meta.csv",
+  "val_video": "WwoTG3_OjUg",
+  "min_speech_ratio": 0.0,
+  "max_speech_ratio": 1.0,
+  "filter_extremes": false,
+  "neg_max": 0.1,
+  "pos_min": 0.6,
+  "use_delta": true,
+  "epochs": 40,
+  "batch_size": 128,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "seed": 42,
+  "device": "cpu"
+}

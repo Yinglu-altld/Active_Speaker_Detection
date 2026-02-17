@@ -81,20 +81,17 @@ source venv/bin/activate
 ./venv/bin/pip install -r audio_doa/requirements.txt
 ```
 
-### Step 2: Prepare required assets
+### Step 2: Check bundled runtime assets
 
-At minimum:
-
-- MediaPipe model: `data/models/face_landmarker_v2.task`
-- Videos: `data/videos/<video_id>.mp4`
-- Labels: `data/labels/<video_id>-activespeaker.csv`
-
-If you already have a trained visual model, also prepare:
+The repository already includes the pretrained runtime files, so teammates can run inference directly after cloning:
 
 - `data/models/cnn_vvad/best.pt`
 - `data/models/cnn_vvad/config.json`
 - `data/models/cnn_vvad/threshold.json`
 - `data/windows/windows_info.json`
+- `data/models/face_landmarker_v2.task`
+
+You only need to provide extra data files such as `data/videos/*.mp4` and `data/labels/*-activespeaker.csv` if you want to retrain or run offline dataset processing.
 
 ---
 
