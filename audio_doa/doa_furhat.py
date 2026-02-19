@@ -157,7 +157,7 @@ def user_location_xyz(user):
 
 def main():
     p = argparse.ArgumentParser(description="ReSpeaker raw DOA + Silero VAD -> Furhat attend.location")
-    p.add_argument("--furhat-ip", default="192.168.1.109")
+    p.add_argument("--furhat-ip", default="192.168.1.108")
     p.add_argument("--furhat-port", type=int, default=9000)
     p.add_argument("--furhat-auth-key", default="")
     p.add_argument("--fs", type=int, default=16000)
@@ -182,7 +182,7 @@ def main():
     p.add_argument("--speaker-switch-updates", type=int, default=2, help="consistent far-apart updates needed to force speaker switch")
     p.add_argument("--consistency-deg", type=float, default=10.0, help="max azimuth spread for consistent DOA updates")
     p.add_argument("--min-consistent-updates", type=int, default=3, help="required consistent DOA updates before lock update")
-    p.add_argument("--doa-quality-threshold", type=float, default=0.20)
+    p.add_argument("--doa-quality-threshold", type=float, default=0.24)
     p.add_argument("--vad-threshold", type=float, default=0.22)
     p.add_argument("--vad-smooth-alpha", type=float, default=0.80, help="EMA alpha for VAD prob (0 disables smoothing)")
     p.add_argument("--vad-update-threshold", type=float, default=0.30, help="minimum VAD prob required to update DOA")
@@ -194,6 +194,43 @@ def main():
     p.add_argument("--snr-update-ratio", type=float, default=2.2, help="update gate (when VAD low): energy >= noise*ratio + add")
     p.add_argument("--snr-update-add", type=float, default=60.0, help="update gate (when VAD low): energy >= noise*ratio + add")
     p.add_argument("--speech-hold-ms", type=int, default=300, help="continue tracking this long after VAD drops")
+    p.add_argument(
+        "--temporal-consistency-deg",
+        type=float,
+        default=18.0,
+        help="smaller values enforce stronger confidence boost only for stable DOA trajectories",
+    )
+    p.add_argument(
+        "--temporal-jump-penalty-deg",
+        type=float,
+        default=55.0,
+        help="angular jump span where abrupt DOA changes are progressively penalized",
+    )
+    p.add_argument(
+        "--temporal-conf-boost",
+        type=float,
+        default=0.25,
+        help="max confidence boost for temporally consistent DOA (0 disables)",
+    )
+    p.add_argument(
+        "--temporal-conf-penalty",
+        type=float,
+        default=0.40,
+        help="max confidence penalty for abrupt temporal jumps (0 disables)",
+    )
+    p.add_argument(
+        "--az-offset-deg",
+        type=float,
+        default=0.0,
+        help="constant DOA azimuth offset (degrees) to align array coordinates with camera/Furhat bearing frame",
+    )
+    p.add_argument(
+        "--flip-az",
+        action="store_true",
+        default=False,
+        help="mirror DOA azimuth sign before applying --az-offset-deg",
+    )
+    p.add_argument("--no-flip-az", action="store_false", dest="flip_az")
     p.add_argument("--front-only", action="store_true", default=True)
     p.add_argument("--no-front-only", action="store_false", dest="front_only")
     p.add_argument("--use-mirror-branch", action="store_true", default=False, help="use mirrored azimuth candidate (legacy behavior)")
@@ -259,6 +296,12 @@ def main():
         snr_update_add=a.snr_update_add,
         speech_hold_ms=a.speech_hold_ms,
         doa_quality_threshold=a.doa_quality_threshold,
+        temporal_consistency_deg=a.temporal_consistency_deg,
+        temporal_jump_penalty_deg=a.temporal_jump_penalty_deg,
+        temporal_conf_boost=a.temporal_conf_boost,
+        temporal_conf_penalty=a.temporal_conf_penalty,
+        az_offset_deg=a.az_offset_deg,
+        flip_az=bool(a.flip_az),
     )
     doa_est = DOAEstimator(doa_cfg, srp, SileroGate(a.vad_threshold, a.fs))
     sm_az = None

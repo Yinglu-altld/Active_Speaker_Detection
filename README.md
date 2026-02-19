@@ -53,7 +53,6 @@ Related scripts:
 
 - `audio_doa/fusion.py` (fusion scoring logic)
 - `audio_doa/run_live_fusion.py` (one-command realtime entrypoint)
-- `audio_doa/fusion_stub.py` (debug and pipeline validation)
 
 Fusion output:
 

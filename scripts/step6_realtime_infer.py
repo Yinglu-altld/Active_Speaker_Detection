@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
         default="cpu",
         help="MediaPipe delegate selection. Use cpu for headless environments.",
     )
-    parser.add_argument("--max-faces", type=int, default=1)
+    parser.add_argument("--max-faces", type=int, default=2)
     parser.add_argument("--min-oval-size", type=float, default=0.2)
     parser.add_argument("--max-oval-size", type=float, default=0.98)
     parser.add_argument("--edge-margin", type=float, default=0.02)
@@ -507,6 +507,26 @@ def bbox_to_bearing_deg(
     return float(norm * float(hfov_deg))
 
 
+def landmarks_to_bbox(
+    landmarks,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[int, int, int, int] | None:
+    if not landmarks:
+        return None
+    xs = [p.x for p in landmarks]
+    ys = [p.y for p in landmarks]
+    if not xs or not ys:
+        return None
+    x1 = max(0, int(np.floor(min(xs) * frame_width)))
+    y1 = max(0, int(np.floor(min(ys) * frame_height)))
+    x2 = min(frame_width, int(np.ceil(max(xs) * frame_width)))
+    y2 = min(frame_height, int(np.ceil(max(ys) * frame_height)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
 def estimate_user_bearing_deg(
     user: UserBox,
     bbox: tuple[int, int, int, int] | None,
@@ -692,6 +712,7 @@ def process_frame(
     speak_on = args.speak_on_th if args.speak_on_th is not None else spec.threshold
     speak_off = args.speak_off_th if args.speak_off_th is not None else spec.threshold
     if user_boxes is None:
+        frame_h, frame_w = frame.shape[:2]
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = image_module.Image(
             image_module.ImageFormat.SRGB, np.ascontiguousarray(frame_rgb)
@@ -714,6 +735,14 @@ def process_frame(
             )
             if features is None:
                 continue
+            opencv_bbox = landmarks_to_bbox(face_landmarks, frame_w, frame_h)
+            opencv_bearing = bbox_to_bearing_deg(
+                opencv_bbox,
+                frame_w,
+                args.camera_hfov_deg,
+            )
+            if opencv_bearing is not None and args.flip_cnn_bearing:
+                opencv_bearing = -opencv_bearing
             outputs.extend(
                 update_track_state(
                     f"face_{idx}",
@@ -725,8 +754,8 @@ def process_frame(
                     args,
                     speak_on,
                     speak_off,
-                    None,
-                    None,
+                    opencv_bbox,
+                    opencv_bearing,
                 )
             )
     else:

@@ -83,6 +83,7 @@ class SRPPhatDOA:
             return None
 
         scores = np.zeros(self.az_grid.shape[0], dtype=np.float64)
+        pair_best_az_deg: List[float] = []
         for i, j, dx, dy, dist in self.pairs:
             lags, cc_abs = _gcc_phat_curve(
                 mics[:, i],
@@ -96,45 +97,78 @@ class SRPPhatDOA:
             tau_pred = (dx * self.dir_xy[:, 0] + dy * self.dir_xy[:, 1]) / C_SOUND
             pair_score = np.interp(tau_pred, lags, cc_abs, left=0.0, right=0.0)
             scores += pair_score
+            pair_best_az_deg.append(float(self.az_grid[int(np.argmax(pair_score))]))
 
         best_idx = int(np.argmax(scores))
         doa_deg = float(self.az_grid[best_idx])
 
         best = float(scores[best_idx])
-        if scores.shape[0] > 1:
-            second = float(np.max(np.delete(scores, best_idx)))
-        else:
-            second = 0.0
-        mean = float(np.mean(scores)) + 1e-12
-        sharpness = max(0.0, min(1.0, (best - second) / (best + 1e-12)))
-        contrast = max(0.0, min(1.0, (best - mean) / (best + 1e-12)))
-        entropy = _entropy01(scores)
         if self.az_grid.size > 1:
             step_deg = float(self.az_grid[1] - self.az_grid[0])
         else:
             step_deg = 1.0
+        second_idx, second = _second_peak_excluding_window(
+            scores=scores,
+            best_idx=best_idx,
+            window_bins=max(1, int(round(12.0 / max(step_deg, 1e-6)))),
+        )
+
+        mean = float(np.mean(scores)) + 1e-12
+        median = float(np.median(scores)) + 1e-12
+        sharpness = max(0.0, min(1.0, (best - second) / (best + 1e-12)))
+        contrast = max(0.0, min(1.0, (best - mean) / (best + 1e-12)))
+        entropy = _entropy01(scores)
         sigma_deg = _half_max_sigma(scores, best_idx, step_deg)
         peak_ratio = best / (second + 1e-12)
-        peak_ratio_score = max(0.0, min(1.0, 1.0 - math.exp(-max(0.0, peak_ratio - 1.0))))
+        peak_ratio_score = max(
+            0.0,
+            min(1.0, 1.0 - math.exp(-max(0.0, peak_ratio - 1.0))),
+        )
         entropy_score = 1.0 - entropy
-        sigma_score = 0.0 if sigma_deg is None else max(0.0, min(1.0, math.exp(-sigma_deg / 25.0)))
+        sigma_score = (
+            0.0
+            if sigma_deg is None
+            else max(0.0, min(1.0, math.exp(-sigma_deg / 25.0)))
+        )
+        prominence = max(0.0, min(1.0, (best - median) / (best + 1e-12)))
+        consensus_r, consensus_std_deg = _circular_consensus(pair_best_az_deg)
+        consensus_score = max(0.0, min(1.0, consensus_r))
+        peak_sep_deg = (
+            0.0
+            if second_idx is None
+            else abs(_circular_deg_diff(doa_deg, float(self.az_grid[second_idx])))
+        )
+        second_ratio = second / (best + 1e-12)
+
         confidence = max(
             0.0,
             min(
                 1.0,
-                0.35 * peak_ratio_score
-                + 0.25 * contrast
-                + 0.20 * entropy_score
-                + 0.20 * sigma_score,
+                0.24 * peak_ratio_score
+                + 0.16 * contrast
+                + 0.14 * entropy_score
+                + 0.14 * sigma_score
+                + 0.20 * consensus_score
+                + 0.12 * prominence,
             ),
         )
+        if second_ratio > 0.85 and peak_sep_deg >= 120.0:
+            confidence *= 0.80
+        if consensus_score < 0.25:
+            confidence *= 0.85
+
         conf_components = {
             "peak_ratio_score": float(peak_ratio_score),
             "contrast_score": float(contrast),
             "entropy_score": float(entropy_score),
             "sigma_score": float(sigma_score),
             "sharpness_score": float(sharpness),
+            "prominence_score": float(prominence),
+            "pair_consensus_score": float(consensus_score),
+            "pair_consensus_std_deg": float(consensus_std_deg),
+            "peak_separation_deg": float(peak_sep_deg),
             "peak_ratio_raw": float(peak_ratio),
+            "second_ratio_raw": float(second_ratio),
         }
         peaks = _top_peaks(scores, self.az_grid, k=3)
         return DOAResult(
@@ -206,3 +240,41 @@ def _top_peaks(scores: np.ndarray, az_grid: np.ndarray, k: int = 3) -> List[dict
             }
         )
     return peaks
+
+
+def _second_peak_excluding_window(
+    scores: np.ndarray,
+    best_idx: int,
+    window_bins: int,
+) -> tuple[Optional[int], float]:
+    if scores.size <= 1:
+        return None, 0.0
+    window_bins = max(0, int(window_bins))
+    mask = np.ones(scores.shape[0], dtype=bool)
+    lo = max(0, best_idx - window_bins)
+    hi = min(scores.shape[0], best_idx + window_bins + 1)
+    mask[lo:hi] = False
+    if not np.any(mask):
+        return None, 0.0
+    masked_idx = np.where(mask)[0]
+    rel = int(np.argmax(scores[mask]))
+    idx = int(masked_idx[rel])
+    return idx, float(scores[idx])
+
+
+def _circular_deg_diff(a_deg: float, b_deg: float) -> float:
+    return ((b_deg - a_deg + 180.0) % 360.0) - 180.0
+
+
+def _circular_consensus(angles_deg: Sequence[float]) -> tuple[float, float]:
+    if not angles_deg:
+        return 0.0, 180.0
+    ang = np.deg2rad(np.asarray(angles_deg, dtype=np.float64))
+    c = float(np.mean(np.cos(ang)))
+    s = float(np.mean(np.sin(ang)))
+    r = max(0.0, min(1.0, math.hypot(c, s)))
+    if r < 1e-12:
+        return 0.0, 180.0
+    circ_std_rad = math.sqrt(max(0.0, -2.0 * math.log(r)))
+    circ_std_deg = float(np.degrees(circ_std_rad))
+    return r, circ_std_deg

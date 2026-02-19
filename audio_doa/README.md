@@ -133,10 +133,10 @@ Where:
 
 ## Fusion Options
 
-You now have both integration styles:
+Use these two paths only:
 
 1. Drop-in function (`fusion.py`) for direct embedding.
-2. Runnable stub (`fusion_stub.py`) for fast end-to-end score checks.
+2. One-command realtime runner (`run_live_fusion.py`) for CNN + DOA + Furhat.
 
 ### 1) Drop-in function (`fusion.py`)
 
@@ -151,42 +151,7 @@ result = score_users_for_frame(doa_obs, users)
 print(result["speaker_id"], result["speaker_score"])
 ```
 
-### 2) Runnable fusion stub (`fusion_stub.py`)
-
-Read DOA JSONL from stdin and use static users:
-
-```powershell
-python doa_core.py --device 1 --channels 6 --mic-channels 1,2,3,4 --no-emit-idle ^
-| python fusion_stub.py --text ^
-  --users u1,-26,0.80 ^
-  --users u2,154,0.30
-```
-
-Use CNN snapshots from file:
-
-```powershell
-python fusion_stub.py --doa-jsonl doa.jsonl --cnn-jsonl cnn.jsonl --text
-```
-
-`cnn.jsonl` format (one line per snapshot):
-
-```json
-{"t":1739701000.10,"users":[{"user_id":"u1","bearing_deg":-26,"cnn_prob":0.84},{"user_id":"u2","bearing_deg":154,"cnn_prob":0.22}]}
-```
-
-Export `cnn.jsonl` directly from Step 6:
-
-```powershell
-python ../scripts/step6_realtime_infer.py --source furhat --model-dir ../data/models/cnn_vvad --emit-cnn-jsonl cnn.jsonl
-```
-
-Then run fusion on recorded logs:
-
-```powershell
-python fusion_stub.py --doa-jsonl doa.jsonl --cnn-jsonl cnn.jsonl --text
-```
-
-### True Live Fusion (with Furhat attend)
+### 2) Realtime fusion runner (`run_live_fusion.py`)
 
 Single command runner (recommended):
 
@@ -207,30 +172,6 @@ You can tune audio device quickly:
 
 ```powershell
 python run_live_fusion.py --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 --attend-furhat
-```
-
-Run these in parallel terminals.
-
-Terminal A (CNN -> live snapshots):
-
-```powershell
-python ../scripts/step6_realtime_infer.py --source furhat --model-dir ../data/models/cnn_vvad --emit-cnn-jsonl /tmp/cnn_live.jsonl
-```
-
-Terminal B (DOA -> fusion -> Furhat):
-
-```powershell
-python doa_core.py --device 1 --channels 6 --mic-channels 1,2,3,4 --no-emit-idle | python fusion_stub.py --doa-jsonl - --cnn-jsonl-live /tmp/cnn_live.jsonl --text --attend-furhat --furhat-ip 192.168.1.109
-```
-
-If you require 3 terminals, use a FIFO:
-
-```powershell
-mkfifo /tmp/doa_live.pipe
-# Terminal B:
-python doa_core.py --device 1 --channels 6 --mic-channels 1,2,3,4 --no-emit-idle > /tmp/doa_live.pipe
-# Terminal C:
-python fusion_stub.py --doa-jsonl /tmp/doa_live.pipe --cnn-jsonl-live /tmp/cnn_live.jsonl --text --attend-furhat --furhat-ip 192.168.1.109
 ```
 
 ## Notes
