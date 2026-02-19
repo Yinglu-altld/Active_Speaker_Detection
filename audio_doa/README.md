@@ -124,12 +124,13 @@ Each frame is one JSON line:
 `conf_doa` uses:
 
 ```text
-conf_doa = conf_doa_srp * audio_conf
+conf_doa = conf_doa_srp
 ```
 
 Where:
 - `conf_doa_srp` comes from SRP-PHAT peak quality (peak ratio, contrast, entropy, sigma).
-- `audio_conf` comes from speech reliability (VAD + SNR).
+- `audio_conf` remains a separate reliability signal from VAD + SNR.
+- Fusion combines reliability as `0.6 * conf_doa_srp + 0.4 * audio_conf`.
 
 ## Fusion Options
 
@@ -191,10 +192,22 @@ python fusion_stub.py --doa-jsonl doa.jsonl --cnn-jsonl cnn.jsonl --text
 Single command runner (recommended):
 
 ```powershell
-python run_live_fusion.py --furhat-ip 192.168.1.109 --attend-furhat --step6-extra "--show"
+python run_live_fusion.py --furhat-ip 192.168.1.108 --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 --step6-extra "--show --window-width 960 --window-height 540"
 ```
 
-This command starts `step6_realtime_infer.py` and `doa_core.py` internally, fuses in realtime, and sends `attend.user`.
+Pause-tolerant profile (recommended for natural speaking pauses):
+
+```powershell
+python run_live_fusion.py --furhat-ip 192.168.1.108 --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 --speech-hold-sec 1.8 --max-doa-staleness-sec 1.2 --send-hz 2.5 --switch-hits 4 --step6-extra "--show --window-width 960 --window-height 540" --doa-extra "--vad-threshold 0.18 --vad-update-threshold 0.22 --speech-hold-ms 900"
+```
+
+VAD-priority profile (suppress impulse-noise triggers):
+
+```powershell
+python run_live_fusion.py --furhat-ip 192.168.1.108 --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 --step6-extra "--show --window-width 960 --window-height 540" --doa-extra "--vad-threshold 0.18 --vad-update-threshold 0.22 --speech-hold-ms 300 --energy-threshold 99999 --energy-update-threshold 99999 --snr-speech-ratio 999 --snr-speech-add 99999 --snr-update-ratio 999 --snr-update-add 99999"
+```
+
+This command starts `step6_realtime_infer.py` and `doa_core.py` internally, fuses in realtime, and sends Furhat attend commands.
 In the Step6 window, each bbox shows:
 - `c`: CNN score
 - `d`: DOA score for that user
@@ -206,7 +219,7 @@ Active speaker bbox is green; other fused users are orange.
 You can tune audio device quickly:
 
 ```powershell
-python run_live_fusion.py --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 --attend-furhat
+python run_live_fusion.py --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4
 ```
 
 Run these in parallel terminals.
@@ -220,7 +233,7 @@ python ../scripts/step6_realtime_infer.py --source furhat --model-dir ../data/mo
 Terminal B (DOA -> fusion -> Furhat):
 
 ```powershell
-python doa_core.py --device 1 --channels 6 --mic-channels 1,2,3,4 --no-emit-idle | python fusion_stub.py --doa-jsonl - --cnn-jsonl-live /tmp/cnn_live.jsonl --text --attend-furhat --furhat-ip 192.168.1.109
+python doa_core.py --device 1 --channels 6 --mic-channels 1,2,3,4 --no-emit-idle | python fusion_stub.py --doa-jsonl - --cnn-jsonl-live /tmp/cnn_live.jsonl --text --attend-furhat --furhat-ip 192.168.1.108
 ```
 
 If you require 3 terminals, use a FIFO:
@@ -230,7 +243,7 @@ mkfifo /tmp/doa_live.pipe
 # Terminal B:
 python doa_core.py --device 1 --channels 6 --mic-channels 1,2,3,4 --no-emit-idle > /tmp/doa_live.pipe
 # Terminal C:
-python fusion_stub.py --doa-jsonl /tmp/doa_live.pipe --cnn-jsonl-live /tmp/cnn_live.jsonl --text --attend-furhat --furhat-ip 192.168.1.109
+python fusion_stub.py --doa-jsonl /tmp/doa_live.pipe --cnn-jsonl-live /tmp/cnn_live.jsonl --text --attend-furhat --furhat-ip 192.168.1.108
 ```
 
 ## Notes

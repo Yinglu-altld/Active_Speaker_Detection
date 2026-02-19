@@ -97,17 +97,48 @@ You only need to provide extra data files such as `data/videos/*.mp4` and `data/
 
 ## 3. Fastest Full Pipeline Run (Recommended)
 
-Run the complete realtime chain (CNN + DOA + Fusion + Furhat):
+Use `run_live_fusion.py` as the single entrypoint. Furhat head control is enabled by default.
+
+### 3.1 Baseline live fusion (recommended first run)
 
 ```bash
 ./venv/bin/python audio_doa/run_live_fusion.py \
-  --furhat-ip 192.168.1.109 \
-  --attend-furhat \
+  --furhat-ip 192.168.1.108 \
   --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 \
   --step6-extra "--show --window-width 960 --window-height 540"
 ```
 
-This command internally starts:
+### 3.2 Pause-tolerant live fusion (reduce head jitter during natural pauses)
+
+```bash
+./venv/bin/python audio_doa/run_live_fusion.py \
+  --furhat-ip 192.168.1.108 \
+  --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 \
+  --speech-hold-sec 1.8 --max-doa-staleness-sec 1.2 \
+  --send-hz 2.5 --switch-hits 4 \
+  --step6-extra "--show --window-width 960 --window-height 540" \
+  --doa-extra "--vad-threshold 0.18 --vad-update-threshold 0.22 --speech-hold-ms 900"
+```
+
+### 3.3 VAD-priority mode (suppress loud impulse noise like table taps)
+
+```bash
+./venv/bin/python audio_doa/run_live_fusion.py \
+  --furhat-ip 192.168.1.108 \
+  --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 \
+  --step6-extra "--show --window-width 960 --window-height 540" \
+  --doa-extra "--vad-threshold 0.18 --vad-update-threshold 0.22 --speech-hold-ms 300 --energy-threshold 99999 --energy-update-threshold 99999 --snr-speech-ratio 999 --snr-speech-add 99999 --snr-update-ratio 999 --snr-update-add 99999"
+```
+
+What these options do:
+
+- `--step6-extra`: passes extra args directly to `scripts/step6_realtime_infer.py`.
+- `--doa-extra`: passes extra args directly to `audio_doa/doa_core.py`.
+- `--speech-hold-sec`: keeps fusion in speech-active state for short pauses.
+- `--send-hz` and `--switch-hits`: reduce twitchy head switching.
+- High energy/SNR thresholds in VAD-priority mode effectively disable loudness fallback and rely on VAD gating.
+
+This runner internally starts:
 
 - `scripts/step6_realtime_infer.py`
 - `audio_doa/doa_core.py`
@@ -164,7 +195,7 @@ Common optional flags:
 Furhat camera source:
 
 ```bash
-./venv/bin/python scripts/step6_realtime_infer.py --source furhat --furhat-ip 192.168.1.109 --show
+./venv/bin/python scripts/step6_realtime_infer.py --source furhat --furhat-ip 192.168.1.108 --show
 ```
 
 Local webcam source:
