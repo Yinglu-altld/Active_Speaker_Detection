@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import base64
 import json
+import math
 import os
 import sys
 import time
@@ -67,6 +68,100 @@ class UserBox:
     h: int
     location_x: float | None = None
     location_z: float | None = None
+
+
+class ScoreHistory:
+    def __init__(self, max_points: int = 140):
+        self.max_points = max(20, int(max_points))
+        self._series: dict[str, dict[str, deque]] = {}
+        self._palette: list[tuple[int, int, int]] = [
+            (59, 85, 255),
+            (70, 195, 120),
+            (255, 150, 60),
+            (205, 80, 235),
+            (90, 210, 220),
+            (230, 220, 70),
+            (170, 110, 255),
+            (255, 180, 170),
+            (110, 210, 120),
+            (245, 130, 210),
+            (120, 230, 230),
+            (170, 170, 170),
+        ]
+        self._colors: dict[str, tuple[int, int, int]] = {}
+
+    def _ensure(self, track_id: str) -> dict[str, deque]:
+        series = self._series.get(track_id)
+        if series is None:
+            series = {
+                "cnn": deque(maxlen=self.max_points),
+                "doa": deque(maxlen=self.max_points),
+                "overall": deque(maxlen=self.max_points),
+            }
+            self._series[track_id] = series
+            if track_id not in self._colors:
+                color_idx = len(self._colors) % len(self._palette)
+                self._colors[track_id] = self._palette[color_idx]
+        return series
+
+    @staticmethod
+    def _to_score(value) -> float:
+        if value is None:
+            return float("nan")
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+        return float(np.clip(score, 0.0, 1.0))
+
+    def update(self, outputs: list[dict], hide_values: bool = False) -> None:
+        if hide_values:
+            for out in outputs:
+                track_id = str(out.get("track_id"))
+                if not track_id:
+                    continue
+                self._ensure(track_id)
+            for series in self._series.values():
+                series["cnn"].append(0.0)
+                series["doa"].append(0.0)
+                series["overall"].append(0.0)
+            return
+
+        frame_values: dict[str, tuple[float, float, float]] = {}
+        for out in outputs:
+            track_id = str(out.get("track_id"))
+            if not track_id:
+                continue
+            series = self._ensure(track_id)
+            cnn_score = out.get("fusion_cnn")
+            if cnn_score is None:
+                cnn_score = out.get("prob")
+            frame_values[track_id] = (
+                self._to_score(cnn_score),
+                self._to_score(out.get("fusion_doa")),
+                self._to_score(out.get("fusion_overall")),
+            )
+
+        for track_id, series in self._series.items():
+            cnn_score, doa_score, overall_score = frame_values.get(
+                track_id,
+                (float("nan"), float("nan"), float("nan")),
+            )
+            series["cnn"].append(cnn_score)
+            series["doa"].append(doa_score)
+            series["overall"].append(overall_score)
+
+    def get(self, track_id: str) -> dict[str, deque] | None:
+        return self._series.get(str(track_id))
+
+    def get_color(self, track_id: str) -> tuple[int, int, int]:
+        if track_id not in self._colors:
+            color_idx = len(self._colors) % len(self._palette)
+            self._colors[track_id] = self._palette[color_idx]
+        return self._colors[track_id]
+
+    def items(self):
+        return self._series.items()
 
 
 class FrameRateLimiter:
@@ -220,6 +315,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fusion-default-sigma-deg", type=float, default=25.0)
     parser.add_argument("--fusion-min-sigma-deg", type=float, default=8.0)
+    parser.add_argument(
+        "--min-speaker-score",
+        type=float,
+        default=0.30,
+        help="Minimum fusion score required to mark a speaker as active in UI overlay.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--window-width", type=int, default=960)
@@ -370,90 +471,214 @@ def prob_color(prob: float) -> tuple[int, int, int]:
     return (0, 255, 0)
 
 
-def _fmt_float(value) -> str:
-    if value is None:
-        return "-"
-    try:
-        return f"{float(value):.2f}"
-    except (TypeError, ValueError):
-        return "-"
-
-
 def _draw_status_hud(frame, hud: dict | None) -> None:
     if not hud:
         return
     mode = str(hud.get("mode", "UNKNOWN"))
-    speech_active = bool(hud.get("speech_active", False))
-    face_count = int(hud.get("face_count", 0))
-    speaker_id = hud.get("speaker_id")
-    speaker_score = hud.get("speaker_score")
-    doa = hud.get("doa") or {}
-    azimuth = doa.get("azimuth_deg")
-    reliability = doa.get("reliability")
-    conf_geom = doa.get("conf_doa_srp")
-    audio_conf = doa.get("audio_conf")
-    sigma_deg = doa.get("sigma_deg")
+    if mode == "NO_SPEECH":
+        state_color = (0, 0, 255)
+    elif mode in ("SPEECH_AV", "SPEECH_CNN_ONLY", "SPEECH_DOA_ONLY"):
+        state_color = (0, 255, 0)
+    else:
+        state_color = (0, 165, 255)
 
-    lines = [
-        (
-            f"mode:{mode} speech:{int(speech_active)} faces:{face_count} "
-            f"speaker:{speaker_id if speaker_id is not None else '-'} "
-            f"score:{_fmt_float(speaker_score)}"
-        ),
-        (
-            f"doa az:{_fmt_float(azimuth)} rel:{_fmt_float(reliability)} "
-            f"geom:{_fmt_float(conf_geom)} audio:{_fmt_float(audio_conf)} "
-            f"sigma:{_fmt_float(sigma_deg)}"
-        ),
-    ]
-    box_h = 22 * len(lines) + 12
-    cv2.rectangle(frame, (8, 8), (frame.shape[1] - 8, 8 + box_h), (20, 20, 20), -1)
-    y = 30
-    for line in lines:
+    state_text = f"STATE: {mode}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 1.0
+    thickness = 3
+    (text_w, text_h), baseline = cv2.getTextSize(state_text, font, scale, thickness)
+    pad_x = 18
+    pad_y = 12
+    x1 = max(8, int((frame.shape[1] - (text_w + 2 * pad_x)) / 2))
+    y1 = 8
+    x2 = min(frame.shape[1] - 8, x1 + text_w + 2 * pad_x)
+    y2 = y1 + text_h + 2 * pad_y + baseline
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (20, 20, 20), -1)
+    text_x = x1 + pad_x
+    text_y = y2 - pad_y - baseline
+    cv2.putText(
+        frame,
+        state_text,
+        (text_x, text_y),
+        font,
+        scale,
+        state_color,
+        thickness,
+        lineType=cv2.LINE_AA,
+    )
+
+
+def _draw_score_line(
+    frame: np.ndarray,
+    values: list[float],
+    x0: int,
+    y0: int,
+    width: int,
+    height: int,
+    color: tuple[int, int, int],
+) -> None:
+    if len(values) < 2 or width <= 1 or height <= 1:
+        return
+    segments: list[list[list[int]]] = []
+    current: list[list[int]] = []
+    denom = max(1, len(values) - 1)
+    for i, value in enumerate(values):
+        if math.isnan(value):
+            if len(current) >= 2:
+                segments.append(current)
+            current = []
+            continue
+        px = x0 + int(round((i / denom) * (width - 1)))
+        py = y0 + int(round((1.0 - value) * (height - 1)))
+        current.append([px, py])
+    if len(current) >= 2:
+        segments.append(current)
+    for segment in segments:
+        pts = np.array(segment, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(frame, [pts], False, color, 2, lineType=cv2.LINE_AA)
+
+
+def render_score_board(
+    outputs: list[dict],
+    hud: dict | None,
+    score_history: ScoreHistory,
+    width: int = 980,
+    height: int = 700,
+) -> np.ndarray:
+    board = np.full((height, width, 3), 16, dtype=np.uint8)
+    mode = "UNKNOWN" if hud is None else str(hud.get("mode", "UNKNOWN"))
+    if mode == "NO_SPEECH":
+        mode_color = (0, 0, 255)
+    elif mode in ("SPEECH_AV", "SPEECH_CNN_ONLY", "SPEECH_DOA_ONLY"):
+        mode_color = (0, 255, 0)
+    else:
+        mode_color = (0, 165, 255)
+    cv2.putText(
+        board,
+        f"STATE: {mode}",
+        (16, 36),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        mode_color,
+        2,
+        lineType=cv2.LINE_AA,
+    )
+
+    user_ids: list[str] = []
+    for out in outputs:
+        user_id = str(out.get("track_id"))
+        if user_id not in user_ids:
+            user_ids.append(user_id)
+    for user_id, _series in score_history.items():
+        if user_id not in user_ids:
+            user_ids.append(user_id)
+    user_ids = user_ids[:8]
+
+    legend_y = 60
+    legend_x = 16
+    for user_id in user_ids:
+        color = score_history.get_color(user_id)
+        cv2.rectangle(board, (legend_x, legend_y), (legend_x + 14, legend_y + 14), color, -1)
         cv2.putText(
-            frame,
-            line,
-            (16, y),
+            board,
+            user_id,
+            (legend_x + 20, legend_y + 12),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            (255, 255, 255),
-            2,
+            0.45,
+            (235, 235, 235),
+            1,
             lineType=cv2.LINE_AA,
         )
-        y += 22
+        legend_x += 125
+        if legend_x > (width - 140):
+            legend_x = 16
+            legend_y += 20
+
+    header_h = legend_y + 24
+    metrics = [("CNN Score", "cnn"), ("DOA Score", "doa"), ("Overall Score", "overall")]
+    pad = 16
+    section_gap = 12
+    usable_h = height - header_h - pad
+    section_h = max(110, (usable_h - section_gap * (len(metrics) - 1)) // len(metrics))
+    section_w = width - 2 * pad
+
+    for idx, (title, key) in enumerate(metrics):
+        y1 = header_h + idx * (section_h + section_gap)
+        y2 = y1 + section_h
+        x1 = pad
+        x2 = x1 + section_w
+        cv2.rectangle(board, (x1, y1), (x2, y2), (38, 38, 38), 1)
+        cv2.putText(
+            board,
+            title,
+            (x1 + 8, y1 + 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (220, 220, 220),
+            1,
+            lineType=cv2.LINE_AA,
+        )
+
+        plot_x = x1 + 52
+        plot_y = y1 + 26
+        plot_w = section_w - 64
+        plot_h = section_h - 36
+        cv2.rectangle(board, (plot_x, plot_y), (plot_x + plot_w, plot_y + plot_h), (70, 70, 70), 1)
+        mid_y = plot_y + plot_h // 2
+        cv2.line(board, (plot_x, mid_y), (plot_x + plot_w, mid_y), (55, 55, 55), 1)
+        cv2.putText(board, "1.0", (x1 + 8, plot_y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+        cv2.putText(board, "0.5", (x1 + 8, mid_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+        cv2.putText(board, "0.0", (x1 + 8, plot_y + plot_h), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+
+        for user_id in user_ids:
+            series = score_history.get(user_id)
+            if not series:
+                continue
+            _draw_score_line(
+                board,
+                list(series[key]),
+                plot_x,
+                plot_y,
+                plot_w,
+                plot_h,
+                score_history.get_color(user_id),
+            )
+
+    return board
 
 
-def draw_overlays(frame, outputs, hud: dict | None = None) -> None:
+def draw_overlays(
+    frame,
+    outputs,
+    hud: dict | None = None,
+) -> None:
     _draw_status_hud(frame, hud)
-    y = 24
+    no_speech_mode = bool(hud and str(hud.get("mode", "")) == "NO_SPEECH")
     for out in outputs:
-        track_id = out["track_id"]
-        prob_out = out["prob"]
-        speak = out["speak"]
         bbox = out.get("bbox")
-        overall = out.get("fusion_overall")
         score_cnn = out.get("fusion_cnn")
         score_doa = out.get("fusion_doa")
+        overall = out.get("fusion_overall")
         is_active = bool(out.get("active_speaker"))
         no_speech = bool(out.get("no_speech"))
-        if overall is None:
-            label = f"{track_id} cnn:{prob_out:.2f} speak:{int(speak)} ns:{int(no_speech)}"
-        else:
-            label = (
-                f"{track_id} c:{float(score_cnn):.2f} d:{float(score_doa):.2f} "
-                f"o:{float(overall):.2f} a:{int(is_active)} ns:{int(no_speech)}"
-            )
-        if no_speech:
+        if no_speech_mode or no_speech:
             color = (0, 0, 255)
         elif is_active:
             color = (0, 255, 0)
-        elif overall is not None:
+        elif out.get("fusion_overall") is not None:
             color = (0, 165, 255)
         else:
-            color = prob_color(prob_out)
+            color = prob_color(float(out.get("prob", 0.0)))
         if bbox:
             x1, y1, x2, y2 = bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            if no_speech_mode:
+                label = "cnn:- doa:- o:-"
+            else:
+                cnn_txt = "-" if score_cnn is None else f"{float(score_cnn):.2f}"
+                doa_txt = "-" if score_doa is None else f"{float(score_doa):.2f}"
+                over_txt = "-" if overall is None else f"{float(overall):.2f}"
+                label = f"cnn:{cnn_txt} doa:{doa_txt} o:{over_txt}"
             text_x = x1
             text_y = max(18, y1 - 6)
             cv2.putText(
@@ -461,23 +686,11 @@ def draw_overlays(frame, outputs, hud: dict | None = None) -> None:
                 label,
                 (text_x, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.55,
                 color,
                 2,
                 lineType=cv2.LINE_AA,
             )
-        else:
-            cv2.putText(
-                frame,
-                label,
-                (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-                lineType=cv2.LINE_AA,
-            )
-            y += 22
 
 
 def draw_landmark_points(frame, landmarks, indices, color=(0, 255, 0)) -> None:
@@ -659,6 +872,7 @@ class FusionOverlayRuntime:
             )
         self.live_doa = LiveDOASnapshots(args.doa_jsonl_live)
         self.max_staleness_sec = float(args.max_doa_staleness_sec)
+        self.min_speaker_score = float(args.min_speaker_score)
         self.cfg = FusionConfig(
             min_sigma_deg=float(args.fusion_min_sigma_deg),
             default_sigma_deg=float(args.fusion_default_sigma_deg),
@@ -668,7 +882,7 @@ class FusionOverlayRuntime:
     def annotate_outputs(self, outputs: list[dict], t_value: float) -> dict:
         doa_obs = self.live_doa.get_for_time(t_value=t_value, max_staleness_sec=self.max_staleness_sec)
         hud = {
-            "mode": "DOA_MISSING" if doa_obs is None else "SPEECH_AV",
+            "mode": "NO_SPEECH" if doa_obs is None else "SPEECH_AV",
             "speech_active": False if doa_obs is None else bool(doa_obs.get("speech_active") or doa_obs.get("speech_detected")),
             "face_count": len(outputs),
             "speaker_id": None,
@@ -689,7 +903,7 @@ class FusionOverlayRuntime:
                 out["fusion_cnn"] = float(out["prob"])
                 out["fusion_doa"] = 0.0
                 out["active_speaker"] = False
-                out["no_speech"] = False
+                out["no_speech"] = True
             return hud
 
         speech_active = bool(doa_obs.get("speech_active") or doa_obs.get("speech_detected"))
@@ -719,11 +933,16 @@ class FusionOverlayRuntime:
             )
 
         if not users:
-            hud["mode"] = "SPEECH_CNN_ONLY"
-            if outputs:
-                top = max(outputs, key=lambda item: float(item["prob"]))
-                hud["speaker_id"] = str(top["track_id"])
-                hud["speaker_score"] = float(top["prob"])
+            if doa_obs.get("azimuth_deg") is not None:
+                hud["mode"] = "SPEECH_DOA_ONLY"
+                hud["speaker_id"] = None
+                hud["speaker_score"] = None
+            else:
+                hud["mode"] = "SPEECH_CNN_ONLY"
+                if outputs:
+                    top = max(outputs, key=lambda item: float(item["prob"]))
+                    hud["speaker_id"] = str(top["track_id"])
+                    hud["speaker_score"] = float(top["prob"])
             for out in outputs:
                 out["fusion_overall"] = None
                 out["fusion_cnn"] = float(out["prob"])
@@ -734,12 +953,16 @@ class FusionOverlayRuntime:
 
         result = score_users_for_frame(doa_obs=doa_obs, users=users, cfg=self.cfg)
         hud["mode"] = "SPEECH_AV"
-        hud["speaker_id"] = result.get("speaker_id")
-        hud["speaker_score"] = result.get("speaker_score")
+        raw_speaker_id = result.get("speaker_id")
+        raw_speaker_score = result.get("speaker_score")
+        active_id = None
+        if raw_speaker_score is not None and float(raw_speaker_score) >= self.min_speaker_score:
+            active_id = raw_speaker_id
+        hud["speaker_id"] = active_id
+        hud["speaker_score"] = raw_speaker_score
         hud["weights"] = result.get("weights", hud["weights"])
         hud["doa"] = result.get("doa", hud["doa"])
         score_map = {str(item["user_id"]): item for item in result.get("per_user", [])}
-        active_id = result.get("speaker_id")
         for out in outputs:
             row = score_map.get(str(out["track_id"]))
             if row is None:
@@ -772,6 +995,7 @@ def process_frame(
     user_boxes: list[UserBox] | None,
     cnn_jsonl_handle=None,
     fusion_runtime: FusionOverlayRuntime | None = None,
+    score_history: ScoreHistory | None = None,
 ) -> bool:
     now = time.time()
     if not limiter.should_process(now):
@@ -905,6 +1129,9 @@ def process_frame(
     hud = None
     if fusion_runtime is not None:
         hud = fusion_runtime.annotate_outputs(outputs, now)
+    if score_history is not None:
+        hide_values = bool(hud and str(hud.get("mode", "")) == "NO_SPEECH")
+        score_history.update(outputs, hide_values=hide_values)
 
     if outputs:
         for out in outputs:
@@ -926,6 +1153,9 @@ def process_frame(
     if args.show:
         draw_overlays(frame, outputs, hud)
         cv2.imshow("vvad_realtime", frame)
+        if score_history is not None:
+            score_board = render_score_board(outputs, hud, score_history)
+            cv2.imshow("vvad_scores", score_board)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             return False
     return True
@@ -998,6 +1228,7 @@ async def run_furhat_stream(
     limiter: FrameRateLimiter,
     cnn_jsonl_handle=None,
     fusion_runtime: FusionOverlayRuntime | None = None,
+    score_history: ScoreHistory | None = None,
 ) -> None:
     try:
         from furhat_realtime_api import AsyncFurhatClient, Events
@@ -1102,6 +1333,7 @@ async def run_furhat_stream(
                 latest_users,
                 cnn_jsonl_handle,
                 fusion_runtime,
+                score_history,
             )
             if not keep_running:
                 break
@@ -1159,12 +1391,19 @@ def main() -> None:
     fusion_runtime = None
     if args.doa_jsonl_live:
         fusion_runtime = FusionOverlayRuntime(args)
+    score_history = ScoreHistory() if args.show else None
     if args.show:
         cv2.namedWindow("vvad_realtime", cv2.WINDOW_NORMAL)
         cv2.resizeWindow(
             "vvad_realtime",
             max(320, int(args.window_width)),
             max(240, int(args.window_height)),
+        )
+        cv2.namedWindow("vvad_scores", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(
+            "vvad_scores",
+            max(700, int(args.window_width)),
+            max(520, int(args.window_height)),
         )
     cnn_jsonl_handle = None
     if args.emit_cnn_jsonl:
@@ -1184,6 +1423,7 @@ def main() -> None:
                         limiter,
                         cnn_jsonl_handle,
                         fusion_runtime,
+                        score_history,
                     )
                 )
             else:
@@ -1220,6 +1460,7 @@ def main() -> None:
                         None,
                         cnn_jsonl_handle,
                         fusion_runtime,
+                        score_history,
                     ):
                         break
                 cap.release()

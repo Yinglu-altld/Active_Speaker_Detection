@@ -1,5 +1,2 @@
-numpy>=1.26
-sounddevice>=0.4.6
+pyusb>=1.2.1
 websocket-client>=1.8.0
-silero-vad>=5.1.2
-torch>=2.2

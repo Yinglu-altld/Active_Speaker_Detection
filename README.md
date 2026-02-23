@@ -36,14 +36,12 @@ Pipeline:
 Related scripts:
 
 - `audio_doa/doa_core.py`
-- `audio_doa/srp_phat.py`
 
 Pipeline:
 
-1. Capture multichannel microphone audio (for example ReSpeaker 6-channel)
-2. Use VAD + energy gating to detect speech activity
-3. Use SRP-PHAT to estimate `azimuth_deg` (source direction)
-4. Output JSON fields such as `conf_doa`, `conf_doa_srp`, `audio_conf`, `sigma_deg`
+1. Read **ReSpeaker built-in** DOA + VAD over USB control (pyusb)
+2. Convert hardware DOA into robot bearing convention (`0` = front, `+` = right, `-` = left)
+3. Output JSON fields such as `azimuth_deg`, `speech_active`, `conf_doa_srp`, `audio_conf`
 
 ---
 
@@ -104,7 +102,6 @@ Use `run_live_fusion.py` as the single entrypoint. Furhat head control is enable
 ```bash
 ./venv/bin/python audio_doa/run_live_fusion.py \
   --furhat-ip 192.168.1.108 \
-  --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 \
   --step6-extra "--show --window-width 960 --window-height 540"
 ```
 
@@ -113,30 +110,17 @@ Use `run_live_fusion.py` as the single entrypoint. Furhat head control is enable
 ```bash
 ./venv/bin/python audio_doa/run_live_fusion.py \
   --furhat-ip 192.168.1.108 \
-  --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 \
-  --speech-hold-sec 1.8 --max-doa-staleness-sec 1.2 \
   --send-hz 2.5 --switch-hits 4 \
   --step6-extra "--show --window-width 960 --window-height 540" \
-  --doa-extra "--vad-threshold 0.18 --vad-update-threshold 0.22 --speech-hold-ms 900"
-```
-
-### 3.3 VAD-priority mode (suppress loud impulse noise like table taps)
-
-```bash
-./venv/bin/python audio_doa/run_live_fusion.py \
-  --furhat-ip 192.168.1.108 \
-  --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 \
-  --step6-extra "--show --window-width 960 --window-height 540" \
-  --doa-extra "--vad-threshold 0.18 --vad-update-threshold 0.22 --speech-hold-ms 300 --energy-threshold 99999 --energy-update-threshold 99999 --snr-speech-ratio 999 --snr-speech-add 99999 --snr-update-ratio 999 --snr-update-add 99999"
+  --doa-extra "--speech-hold-ms 900"
 ```
 
 What these options do:
 
 - `--step6-extra`: passes extra args directly to `scripts/step6_realtime_infer.py`.
 - `--doa-extra`: passes extra args directly to `audio_doa/doa_core.py`.
-- `--speech-hold-sec`: keeps fusion in speech-active state for short pauses.
+- `--speech-hold-ms` (inside `--doa-extra`): keeps audio speech-active through short pauses.
 - `--send-hz` and `--switch-hits`: reduce twitchy head switching.
-- High energy/SNR thresholds in VAD-priority mode effectively disable loudness fallback and rely on VAD gating.
 
 This runner internally starts:
 

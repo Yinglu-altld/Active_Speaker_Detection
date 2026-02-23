@@ -24,13 +24,9 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Default DOA->Furhat calibration (kept internal on purpose, no CLI flags).
-# Mirrors prior doa_furhat behavior to avoid left/right inversion on ReSpeaker setup.
-DOA_AZ_OFFSET_DEG = -45.0
-DOA_AZ_GAIN = 0.70
-DOA_MAX_AZ_DEG = 60.0
-DOA_FRONT_ONLY = True
-DOA_FLIP_X = True
+# DOA azimuth_deg is expected to already be in robot bearing convention:
+# 0 = forward (+Z), + = right (+X), - = left (-X).
+DOA_DEADBAND_DEG = 4.0
 
 
 class FurhatWS:
@@ -110,6 +106,7 @@ class DOAStreamPump:
         self.output_path = output_path
         self.handle = None
         self.latest = None
+        self.latest_seq = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
@@ -140,12 +137,19 @@ class DOAStreamPump:
                 continue
             with self._lock:
                 self.latest = item
+                self.latest_seq += 1
 
     def latest_obs(self):
         with self._lock:
             if self.latest is None:
                 return None
             return dict(self.latest)
+
+    def latest_snapshot(self) -> tuple[dict | None, int]:
+        with self._lock:
+            if self.latest is None:
+                return None, self.latest_seq
+            return dict(self.latest), self.latest_seq
 
     def close(self) -> None:
         self._stop.set()
@@ -164,6 +168,8 @@ class AttendState:
     pending_speaker: str | None = None
     pending_hits: int = 0
     last_send_ts: float = 0.0
+    last_location_xyz: tuple[float, float, float] | None = None
+    last_doa_cmd_az_deg: float | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -187,7 +193,7 @@ def parse_args() -> argparse.Namespace:
         choices=["furhat", "opencv", "file", "stream"],
         default="furhat",
     )
-    parser.add_argument("--furhat-ip", default="192.168.1.109")
+    parser.add_argument("--furhat-ip", default="192.168.1.108")
     parser.add_argument("--furhat-auth", default=None)
     parser.add_argument(
         "--model-dir",
@@ -195,14 +201,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--step6-extra", action="append", default=[])
 
-    parser.add_argument("--audio-device", type=int, default=1)
-    parser.add_argument("--audio-channels", type=int, default=6)
-    parser.add_argument("--mic-channels", default="1,2,3,4")
     parser.add_argument("--doa-extra", action="append", default=[])
 
     parser.add_argument("--max-cnn-staleness-sec", type=float, default=0.8)
-    parser.add_argument("--max-doa-staleness-sec", type=float, default=0.8)
-    parser.add_argument("--speech-hold-sec", type=float, default=0.6)
+    parser.add_argument(
+        "--idle-after-no-speech-sec",
+        type=float,
+        default=5.0,
+        help="After this much continuous NO_SPEECH, send Furhat to center idle pose.",
+    )
     parser.add_argument("--tick-hz", type=float, default=12.0)
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--json-output", action="store_true")
@@ -252,6 +259,8 @@ def _build_step6_cmd(args: argparse.Namespace) -> list[str]:
         args.cnn_jsonl_live,
         "--doa-jsonl-live",
         args.doa_jsonl_live,
+        "--min-speaker-score",
+        str(float(args.min_speaker_score)),
     ]
     if args.cnn_source == "furhat":
         cmd.extend(["--furhat-ip", args.furhat_ip])
@@ -266,12 +275,6 @@ def _build_doa_cmd(args: argparse.Namespace) -> list[str]:
     cmd = [
         args.python_exe,
         str(PROJECT_ROOT / "audio_doa" / "doa_core.py"),
-        "--device",
-        str(args.audio_device),
-        "--channels",
-        str(args.audio_channels),
-        "--mic-channels",
-        str(args.mic_channels),
         "--no-emit-idle",
     ]
     for extra in args.doa_extra:
@@ -287,47 +290,10 @@ def _wrap_deg(angle_deg: float) -> float:
     return ((float(angle_deg) + 180.0) % 360.0) - 180.0
 
 
-def _fold_front(angle_deg: float) -> float:
-    angle = _wrap_deg(angle_deg)
-    if angle > 90.0:
-        return 180.0 - angle
-    if angle < -90.0:
-        return -180.0 - angle
-    return angle
-
-
-def _calibrate_doa_deg(azimuth_deg: float) -> float:
-    angle = _wrap_deg(float(azimuth_deg) + float(DOA_AZ_OFFSET_DEG))
-    if DOA_FRONT_ONLY:
-        angle = _fold_front(angle)
-    angle *= float(DOA_AZ_GAIN)
-    lim = abs(float(DOA_MAX_AZ_DEG))
-    return max(-lim, min(lim, angle))
-
-
 def _doa_reliability(doa_obs: dict) -> float:
     conf_srp = _clip01(float(doa_obs.get("conf_doa_srp") or 0.0))
     audio_conf = _clip01(float(doa_obs.get("audio_conf") or 0.0))
     return 0.6 * conf_srp + 0.4 * audio_conf
-
-
-def _doa_timestamp(doa_obs: dict | None) -> float | None:
-    if doa_obs is None:
-        return None
-    t_value = doa_obs.get("t")
-    if t_value is None:
-        return None
-    try:
-        return float(t_value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _doa_is_fresh(doa_obs: dict | None, now_ts: float, max_age: float) -> bool:
-    t_obs = _doa_timestamp(doa_obs)
-    if t_obs is None:
-        return False
-    return abs(now_ts - t_obs) <= float(max_age)
 
 
 def _obs_speech_active(doa_obs: dict | None) -> bool:
@@ -337,11 +303,9 @@ def _obs_speech_active(doa_obs: dict | None) -> bool:
 
 
 def _azimuth_to_xyz(azimuth_deg: float, distance_m: float, y_m: float) -> tuple[float, float, float]:
-    az_cmd = _calibrate_doa_deg(float(azimuth_deg))
-    ang = math.radians(az_cmd)
+    az = _wrap_deg(float(azimuth_deg))
+    ang = math.radians(az)
     x = float(distance_m * math.sin(ang))
-    if DOA_FLIP_X:
-        x = -x
     z = float(distance_m * math.cos(ang))
     y = float(y_m)
     return x, y, z
@@ -394,6 +358,8 @@ def _handle_user_attend(
         state.pending_speaker = None
         state.pending_hits = 0
         furhat.attend_user(state.current_speaker)
+        state.last_location_xyz = None
+        state.last_doa_cmd_az_deg = None
         state.last_send_ts = now_ts
         return
 
@@ -402,6 +368,8 @@ def _handle_user_attend(
         state.pending_hits = 0
         if now_ts - state.last_send_ts >= min_send_period:
             furhat.attend_user(state.current_speaker)
+            state.last_location_xyz = None
+            state.last_doa_cmd_az_deg = None
             state.last_send_ts = now_ts
         return
 
@@ -416,6 +384,8 @@ def _handle_user_attend(
         state.pending_speaker = None
         state.pending_hits = 0
         furhat.attend_user(state.current_speaker)
+        state.last_location_xyz = None
+        state.last_doa_cmd_az_deg = None
         state.last_send_ts = now_ts
 
 
@@ -431,11 +401,18 @@ def _handle_doa_attend(
     azimuth = doa_obs.get("azimuth_deg")
     if azimuth is None:
         return
+    cmd_az = _wrap_deg(float(azimuth))
+    if state.last_doa_cmd_az_deg is not None:
+        delta_cmd = abs(_wrap_deg(cmd_az - float(state.last_doa_cmd_az_deg)))
+        if delta_cmd < float(DOA_DEADBAND_DEG):
+            return
     if now_ts - state.last_send_ts < min_send_period:
         return
     _reset_attend_state(state)
-    x, y, z = _azimuth_to_xyz(float(azimuth), float(distance_m), float(y_m))
+    x, y, z = _azimuth_to_xyz(cmd_az, float(distance_m), float(y_m))
     furhat.attend_location(x, y, z)
+    state.last_location_xyz = (float(x), float(y), float(z))
+    state.last_doa_cmd_az_deg = float(cmd_az)
     state.last_send_ts = now_ts
 
 
@@ -469,6 +446,25 @@ def _print_text(payload: dict, top_k: int) -> None:
             f"  {item['user_id']}: score={item['score']:.3f} "
             f"cnn={item['score_cnn']:.3f} doa={item['score_doa']:.3f} d={item['delta_deg']:.1f}"
         )
+
+
+def _no_speech_payload(now_ts: float, doa_obs: dict | None) -> dict:
+    return {
+        "mode": "NO_SPEECH",
+        "t": now_ts,
+        "speaker_id": None,
+        "speaker_score": None,
+        "weights": {"cnn": 0.0, "doa": 0.0},
+        "doa": {
+            "azimuth_deg": None if doa_obs is None else doa_obs.get("azimuth_deg"),
+            "conf_doa": 0.0 if doa_obs is None else float(doa_obs.get("conf_doa") or 0.0),
+            "conf_doa_srp": 0.0 if doa_obs is None else float(doa_obs.get("conf_doa_srp") or 0.0),
+            "audio_conf": 0.0 if doa_obs is None else float(doa_obs.get("audio_conf") or 0.0),
+            "sigma_deg": None if doa_obs is None else doa_obs.get("sigma_deg"),
+            "reliability": 0.0 if doa_obs is None else float(_doa_reliability(doa_obs)),
+        },
+        "per_user": [],
+    }
 
 
 def main() -> None:
@@ -531,9 +527,11 @@ def main() -> None:
     attend_state = AttendState()
     min_send_period = 1.0 / max(float(args.send_hz), 1e-3)
     tick_period = 1.0 / max(float(args.tick_hz), 1e-3)
-    speech_active_until = 0.0
     next_tick = time.time()
     last_quiet_log_ts = 0.0
+    no_speech_since_ts = None
+    idle_sent = False
+    last_doa_seq_used = 0
 
     try:
         while True:
@@ -547,46 +545,31 @@ def main() -> None:
                 )
 
             now_ts = time.time()
-            doa_obs = doa_pump.latest_obs()
-            doa_fresh = _doa_is_fresh(
-                doa_obs=doa_obs,
-                now_ts=now_ts,
-                max_age=float(args.max_doa_staleness_sec),
-            )
-            if doa_fresh and _obs_speech_active(doa_obs):
-                speech_active_until = now_ts + float(args.speech_hold_sec)
-            speech_active = now_ts <= speech_active_until
+            doa_latest, doa_seq = doa_pump.latest_snapshot()
+            if doa_latest is not None and doa_seq > last_doa_seq_used:
+                doa_obs = doa_latest
+                last_doa_seq_used = doa_seq
+            else:
+                doa_obs = None
+
+            doa_available = doa_obs is not None
+            speech_active = doa_available and _obs_speech_active(doa_obs)
             users = live_cnn.users_for_time(now_ts, float(args.max_cnn_staleness_sec))
 
             payload = None
             mode = None
             if not speech_active:
                 mode = "NO_SPEECH"
-                payload = {
-                    "mode": mode,
-                    "t": now_ts,
-                    "speaker_id": None,
-                    "speaker_score": None,
-                    "weights": {"cnn": 0.0, "doa": 0.0},
-                    "doa": {
-                        "azimuth_deg": None if doa_obs is None else doa_obs.get("azimuth_deg"),
-                        "conf_doa": 0.0 if doa_obs is None else float(doa_obs.get("conf_doa") or 0.0),
-                        "conf_doa_srp": 0.0 if doa_obs is None else float(doa_obs.get("conf_doa_srp") or 0.0),
-                        "audio_conf": 0.0 if doa_obs is None else float(doa_obs.get("audio_conf") or 0.0),
-                        "sigma_deg": None if doa_obs is None else doa_obs.get("sigma_deg"),
-                        "reliability": 0.0 if doa_obs is None else float(_doa_reliability(doa_obs)),
-                    },
-                    "per_user": [],
-                }
+                payload = _no_speech_payload(now_ts=now_ts, doa_obs=doa_obs)
             elif users:
-                if doa_fresh and doa_obs is not None and doa_obs.get("azimuth_deg") is not None:
+                if doa_available and doa_obs.get("azimuth_deg") is not None:
                     mode = "SPEECH_AV"
                     payload = score_users_for_frame(doa_obs=doa_obs, users=users, cfg=cfg)
                 else:
                     mode = "SPEECH_CNN_ONLY"
                     t_value = now_ts if doa_obs is None else doa_obs.get("t")
                     payload = score_users_cnn_only(users=users, t_value=t_value)
-            elif doa_fresh and doa_obs is not None and doa_obs.get("azimuth_deg") is not None:
+            elif doa_available and doa_obs.get("azimuth_deg") is not None:
                 mode = "SPEECH_DOA_ONLY"
                 payload = {
                     "mode": mode,
@@ -605,32 +588,25 @@ def main() -> None:
                     "per_user": [],
                 }
             else:
-                mode = "SPEECH_NO_EVIDENCE"
-                payload = {
-                    "mode": mode,
-                    "t": now_ts,
-                    "speaker_id": None,
-                    "speaker_score": None,
-                    "weights": {"cnn": 0.0, "doa": 0.0},
-                    "doa": {
-                        "azimuth_deg": None if doa_obs is None else doa_obs.get("azimuth_deg"),
-                        "conf_doa": 0.0 if doa_obs is None else float(doa_obs.get("conf_doa") or 0.0),
-                        "conf_doa_srp": 0.0 if doa_obs is None else float(doa_obs.get("conf_doa_srp") or 0.0),
-                        "audio_conf": 0.0 if doa_obs is None else float(doa_obs.get("audio_conf") or 0.0),
-                        "sigma_deg": None if doa_obs is None else doa_obs.get("sigma_deg"),
-                        "reliability": 0.0 if doa_obs is None else float(_doa_reliability(doa_obs)),
-                    },
-                    "per_user": [],
-                }
+                mode = "NO_SPEECH"
+                payload = _no_speech_payload(now_ts=now_ts, doa_obs=doa_obs)
 
             if "mode" not in payload:
                 payload = dict(payload)
                 payload["mode"] = mode
 
+            if mode == "NO_SPEECH":
+                if no_speech_since_ts is None:
+                    no_speech_since_ts = now_ts
+                    idle_sent = False
+            else:
+                no_speech_since_ts = None
+                idle_sent = False
+
             if args.json_output:
                 print(json.dumps(payload, separators=(",", ":")))
             else:
-                quiet_mode = mode in ("NO_SPEECH", "SPEECH_NO_EVIDENCE")
+                quiet_mode = mode == "NO_SPEECH"
                 if (not quiet_mode) or (now_ts - last_quiet_log_ts >= 1.0):
                     _print_text(payload, args.top_k)
                     if quiet_mode:
@@ -661,6 +637,36 @@ def main() -> None:
                     )
                 else:
                     _reset_attend_state(attend_state)
+                    idle_after = max(0.0, float(args.idle_after_no_speech_sec))
+                    no_speech_elapsed = (
+                        0.0
+                        if no_speech_since_ts is None
+                        else max(0.0, now_ts - float(no_speech_since_ts))
+                    )
+                    # Keep holding the last DOA target during short no-speech gaps
+                    # to avoid abrupt drift-to-center behavior on natural pauses.
+                    if (
+                        attend_state.last_location_xyz is not None
+                        and no_speech_elapsed < idle_after
+                        and (now_ts - attend_state.last_send_ts) >= min_send_period
+                    ):
+                        hold_x, hold_y, hold_z = attend_state.last_location_xyz
+                        furhat.attend_location(hold_x, hold_y, hold_z)
+                        attend_state.last_send_ts = now_ts
+                    if (
+                        no_speech_since_ts is not None
+                        and not idle_sent
+                        and no_speech_elapsed >= idle_after
+                    ):
+                        furhat.attend_location(
+                            0.0,
+                            float(args.doa_target_y_m),
+                            float(args.doa_target_distance_m),
+                        )
+                        attend_state.last_location_xyz = None
+                        attend_state.last_doa_cmd_az_deg = None
+                        attend_state.last_send_ts = now_ts
+                        idle_sent = True
 
             next_tick += tick_period
             sleep_sec = next_tick - time.time()
