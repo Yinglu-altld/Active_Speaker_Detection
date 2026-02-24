@@ -24,14 +24,6 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Default DOA->Furhat calibration (kept internal on purpose, no CLI flags).
-# Mirrors prior doa_furhat behavior to avoid left/right inversion on ReSpeaker setup.
-DOA_AZ_OFFSET_DEG = -45.0
-DOA_AZ_GAIN = 0.70
-DOA_MAX_AZ_DEG = 60.0
-DOA_FRONT_ONLY = True
-DOA_FLIP_X = True
-
 
 class FurhatWS:
     def __init__(
@@ -164,6 +156,7 @@ class AttendState:
     pending_speaker: str | None = None
     pending_hits: int = 0
     last_send_ts: float = 0.0
+    last_doa_azimuth: float | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -198,6 +191,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-device", type=int, default=1)
     parser.add_argument("--audio-channels", type=int, default=6)
     parser.add_argument("--mic-channels", default="1,2,3,4")
+    parser.add_argument("--doa-azimuth-sign", type=int, choices=[-1, 1], default=1)
+    parser.add_argument("--doa-azimuth-offset-deg", type=float, default=0.0)
     parser.add_argument("--doa-extra", action="append", default=[])
 
     parser.add_argument("--max-cnn-staleness-sec", type=float, default=0.8)
@@ -230,11 +225,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slack-yaw", type=float, default=10.0)
     parser.add_argument("--slack-timeout", type=int, default=3000)
     parser.add_argument("--min-speaker-score", type=float, default=0.30)
+    parser.add_argument(
+        "--av-doa-hold-sec",
+        type=float,
+        default=1.2,
+        help="Allow using slightly stale DOA for AV association to reduce CNN-only flicker.",
+    )
     parser.add_argument("--switch-hits", type=int, default=3)
     parser.add_argument("--switch-margin", type=float, default=0.03)
     parser.add_argument("--send-hz", type=float, default=4.0)
     parser.add_argument("--doa-target-distance-m", type=float, default=1.2)
     parser.add_argument("--doa-target-y-m", type=float, default=0.0)
+    parser.add_argument(
+        "--doa-attend-min-reliability",
+        type=float,
+        default=0.14,
+        help="Minimum DOA reliability required before sending attend.location.",
+    )
+    parser.add_argument(
+        "--doa-attend-min-delta-deg",
+        type=float,
+        default=6.0,
+        help="Minimum azimuth change required before sending another attend.location.",
+    )
 
     parser.add_argument("--show-child-logs", action="store_true")
     return parser.parse_args()
@@ -272,6 +285,10 @@ def _build_doa_cmd(args: argparse.Namespace) -> list[str]:
         str(args.audio_channels),
         "--mic-channels",
         str(args.mic_channels),
+        "--azimuth-sign",
+        str(args.doa_azimuth_sign),
+        "--azimuth-offset-deg",
+        str(args.doa_azimuth_offset_deg),
         "--no-emit-idle",
     ]
     for extra in args.doa_extra:
@@ -285,24 +302,6 @@ def _clip01(value: float) -> float:
 
 def _wrap_deg(angle_deg: float) -> float:
     return ((float(angle_deg) + 180.0) % 360.0) - 180.0
-
-
-def _fold_front(angle_deg: float) -> float:
-    angle = _wrap_deg(angle_deg)
-    if angle > 90.0:
-        return 180.0 - angle
-    if angle < -90.0:
-        return -180.0 - angle
-    return angle
-
-
-def _calibrate_doa_deg(azimuth_deg: float) -> float:
-    angle = _wrap_deg(float(azimuth_deg) + float(DOA_AZ_OFFSET_DEG))
-    if DOA_FRONT_ONLY:
-        angle = _fold_front(angle)
-    angle *= float(DOA_AZ_GAIN)
-    lim = abs(float(DOA_MAX_AZ_DEG))
-    return max(-lim, min(lim, angle))
 
 
 def _doa_reliability(doa_obs: dict) -> float:
@@ -336,12 +335,74 @@ def _obs_speech_active(doa_obs: dict | None) -> bool:
     return bool(doa_obs.get("speech_active") or doa_obs.get("speech_detected"))
 
 
+def _build_doa_only_payload(doa_obs: dict) -> dict:
+    return {
+        "mode": "SPEECH_DOA_ONLY",
+        "t": doa_obs.get("t"),
+        "speaker_id": None,
+        "speaker_score": None,
+        "weights": {"cnn": 0.0, "doa": 1.0},
+        "doa": {
+            "azimuth_deg": doa_obs.get("azimuth_deg"),
+            "conf_doa": float(doa_obs.get("conf_doa") or 0.0),
+            "conf_doa_srp": float(doa_obs.get("conf_doa_srp") or 0.0),
+            "audio_conf": float(doa_obs.get("audio_conf") or 0.0),
+            "sigma_deg": doa_obs.get("sigma_deg"),
+            "reliability": float(_doa_reliability(doa_obs)),
+        },
+        "per_user": [],
+    }
+
+
+def _doa_has_azimuth(doa_obs: dict | None) -> bool:
+    return bool(doa_obs is not None and doa_obs.get("azimuth_deg") is not None)
+
+
+def _inject_cnn_payload_with_doa(payload: dict, doa_obs: dict | None, cfg: FusionConfig) -> dict:
+    if not _doa_has_azimuth(doa_obs):
+        return payload
+    out = dict(payload)
+    doa = dict(out.get("doa") or {})
+    az = float(doa_obs.get("azimuth_deg"))
+    sigma_val = doa_obs.get("sigma_deg")
+    if sigma_val is None:
+        sigma = float(cfg.default_sigma_deg)
+    else:
+        sigma = max(float(cfg.min_sigma_deg), float(sigma_val))
+    doa.update(
+        {
+            "azimuth_deg": az,
+            "conf_doa": float(doa_obs.get("conf_doa") or 0.0),
+            "conf_doa_srp": float(doa_obs.get("conf_doa_srp") or 0.0),
+            "audio_conf": float(doa_obs.get("audio_conf") or 0.0),
+            "sigma_deg": doa_obs.get("sigma_deg"),
+            "reliability": float(_doa_reliability(doa_obs)),
+        }
+    )
+    out["doa"] = doa
+
+    per_user = []
+    for item in out.get("per_user", []):
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        try:
+            bearing = float(row.get("bearing_deg"))
+            az_alt = _wrap_deg(az + 180.0)
+            delta = min(abs(_wrap_deg(az - bearing)), abs(_wrap_deg(az_alt - bearing)))
+            row["delta_deg"] = float(delta)
+            row["score_doa"] = float(math.exp(-0.5 * (delta / max(1e-6, sigma)) ** 2))
+        except (TypeError, ValueError):
+            pass
+        per_user.append(row)
+    if per_user:
+        out["per_user"] = per_user
+    return out
+
+
 def _azimuth_to_xyz(azimuth_deg: float, distance_m: float, y_m: float) -> tuple[float, float, float]:
-    az_cmd = _calibrate_doa_deg(float(azimuth_deg))
-    ang = math.radians(az_cmd)
+    ang = math.radians(_wrap_deg(float(azimuth_deg)))
     x = float(distance_m * math.sin(ang))
-    if DOA_FLIP_X:
-        x = -x
     z = float(distance_m * math.cos(ang))
     y = float(y_m)
     return x, y, z
@@ -363,6 +424,7 @@ def _reset_attend_state(state: AttendState) -> None:
     state.current_speaker = None
     state.pending_speaker = None
     state.pending_hits = 0
+    state.last_doa_azimuth = None
 
 
 def _handle_user_attend(
@@ -427,16 +489,27 @@ def _handle_doa_attend(
     min_send_period: float,
     distance_m: float,
     y_m: float,
+    min_reliability: float,
+    min_delta_deg: float,
 ) -> None:
     azimuth = doa_obs.get("azimuth_deg")
     if azimuth is None:
         return
+    reliability = float(doa_obs.get("reliability") or 0.0)
+    if reliability < float(min_reliability):
+        return
     if now_ts - state.last_send_ts < min_send_period:
         return
+    az = float(azimuth)
+    if state.last_doa_azimuth is not None:
+        d = abs(_wrap_deg(az - float(state.last_doa_azimuth)))
+        if d < float(min_delta_deg):
+            return
     _reset_attend_state(state)
-    x, y, z = _azimuth_to_xyz(float(azimuth), float(distance_m), float(y_m))
+    x, y, z = _azimuth_to_xyz(az, float(distance_m), float(y_m))
     furhat.attend_location(x, y, z)
     state.last_send_ts = now_ts
+    state.last_doa_azimuth = az
 
 
 def _print_text(payload: dict, top_k: int) -> None:
@@ -467,7 +540,9 @@ def _print_text(payload: dict, top_k: int) -> None:
     for item in payload.get("per_user", [])[: max(1, int(top_k))]:
         print(
             f"  {item['user_id']}: score={item['score']:.3f} "
-            f"cnn={item['score_cnn']:.3f} doa={item['score_doa']:.3f} d={item['delta_deg']:.1f}"
+            f"cnn={item['score_cnn']:.3f} doa={item['score_doa']:.3f} "
+            f"pc={float(item.get('part_cnn', 0.0)):.3f} pd={float(item.get('part_doa', 0.0)):.3f} "
+            f"d={item['delta_deg']:.1f}"
         )
 
 
@@ -553,6 +628,12 @@ def main() -> None:
                 now_ts=now_ts,
                 max_age=float(args.max_doa_staleness_sec),
             )
+            doa_association_fresh = _doa_is_fresh(
+                doa_obs=doa_obs,
+                now_ts=now_ts,
+                max_age=max(float(args.max_doa_staleness_sec), float(args.av_doa_hold_sec)),
+            )
+            doa_for_assoc = doa_obs if (doa_association_fresh and _doa_has_azimuth(doa_obs)) else None
             if doa_fresh and _obs_speech_active(doa_obs):
                 speech_active_until = now_ts + float(args.speech_hold_sec)
             speech_active = now_ts <= speech_active_until
@@ -579,31 +660,21 @@ def main() -> None:
                     "per_user": [],
                 }
             elif users:
-                if doa_fresh and doa_obs is not None and doa_obs.get("azimuth_deg") is not None:
+                if speech_active and doa_for_assoc is not None:
                     mode = "SPEECH_AV"
-                    payload = score_users_for_frame(doa_obs=doa_obs, users=users, cfg=cfg)
+                    payload = score_users_for_frame(
+                        doa_obs=doa_for_assoc,
+                        users=users,
+                        cfg=cfg,
+                    )
                 else:
                     mode = "SPEECH_CNN_ONLY"
                     t_value = now_ts if doa_obs is None else doa_obs.get("t")
                     payload = score_users_cnn_only(users=users, t_value=t_value)
-            elif doa_fresh and doa_obs is not None and doa_obs.get("azimuth_deg") is not None:
+                    payload = _inject_cnn_payload_with_doa(payload, doa_for_assoc, cfg)
+            elif speech_active and doa_for_assoc is not None:
                 mode = "SPEECH_DOA_ONLY"
-                payload = {
-                    "mode": mode,
-                    "t": doa_obs.get("t"),
-                    "speaker_id": None,
-                    "speaker_score": None,
-                    "weights": {"cnn": 0.0, "doa": 1.0},
-                    "doa": {
-                        "azimuth_deg": doa_obs.get("azimuth_deg"),
-                        "conf_doa": float(doa_obs.get("conf_doa") or 0.0),
-                        "conf_doa_srp": float(doa_obs.get("conf_doa_srp") or 0.0),
-                        "audio_conf": float(doa_obs.get("audio_conf") or 0.0),
-                        "sigma_deg": doa_obs.get("sigma_deg"),
-                        "reliability": float(_doa_reliability(doa_obs)),
-                    },
-                    "per_user": [],
-                }
+                payload = _build_doa_only_payload(doa_for_assoc)
             else:
                 mode = "SPEECH_NO_EVIDENCE"
                 payload = {
@@ -658,6 +729,8 @@ def main() -> None:
                         min_send_period=min_send_period,
                         distance_m=float(args.doa_target_distance_m),
                         y_m=float(args.doa_target_y_m),
+                        min_reliability=float(args.doa_attend_min_reliability),
+                        min_delta_deg=float(args.doa_attend_min_delta_deg),
                     )
                 else:
                     _reset_attend_state(attend_state)

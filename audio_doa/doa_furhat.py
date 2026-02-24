@@ -16,17 +16,21 @@ except ImportError:
     from srp_phat import SRPPhatDOA
 
 
-MIC_XY = np.array([[0.028, 0.0], [0.0, 0.028], [-0.028, 0.0], [0.0, -0.028]], dtype=np.float64)
+_MIC_R = 0.028 / np.sqrt(2.0)
+MIC_XY = np.array(
+    [
+        [_MIC_R, _MIC_R],    # mic1 (front-right)
+        [_MIC_R, -_MIC_R],   # mic2 (front-left)
+        [-_MIC_R, -_MIC_R],  # mic3 (back-left)
+        [-_MIC_R, _MIC_R],   # mic4 (back-right)
+    ],
+    dtype=np.float64,
+)
 
 
 def wrap(a): return ((a + 180.0) % 360.0) - 180.0
 def cdelta(a, b): return wrap(b - a)
 def cblend(a, b, alpha): return wrap(a + alpha * cdelta(a, b))
-def fold_front(az):
-    az = wrap(az)
-    if az > 90.0: return 180.0 - az
-    if az < -90.0: return -180.0 - az
-    return az
 
 
 class FurhatWS:
@@ -112,16 +116,10 @@ class FurhatWS:
         self._send(payload)
 
 
-def map_doa_to_az(doa, board_cw, offset, add_180, front_only, max_az):
-    az1 = wrap(offset + ((-doa) if board_cw else doa) + (180.0 if add_180 else 0.0))
-    az2 = wrap(az1 + 180.0)
-    if front_only:
-        az1 = fold_front(az1)
-        az2 = fold_front(az2)
-    lim = abs(max_az)
-    az1 = max(-lim, min(lim, az1))
-    az2 = max(-lim, min(lim, az2))
-    return az1, az2
+def map_doa_to_az(doa):
+    # Canonical project frame:
+    # front=0, right=+90, left=-90, back=+-180.
+    return wrap(doa)
 
 
 def user_bearing_deg(user):
@@ -170,10 +168,6 @@ def main():
     p.add_argument("--srp-interp", type=int, default=4)
     p.add_argument("--srp-f-low-hz", type=float, default=300.0)
     p.add_argument("--srp-f-high-hz", type=float, default=3400.0)
-    p.add_argument("--board-zero-offset", type=float, default=-45.0)
-    p.add_argument("--board-cw", action="store_true", default=False)
-    p.add_argument("--no-board-cw", action="store_false", dest="board_cw")
-    p.add_argument("--add-180", action="store_true", help="add 180 deg to DOA mapping")
     p.add_argument("--attend-mode", choices=("location", "closest-user", "hybrid", "doa-user-match"), default="doa-user-match")
     p.add_argument("--smooth-alpha", type=float, default=0.18)
     p.add_argument("--lock-alpha", type=float, default=0.14, help="update rate for locked azimuth during one speech segment")
@@ -194,15 +188,8 @@ def main():
     p.add_argument("--snr-update-ratio", type=float, default=2.2, help="update gate (when VAD low): energy >= noise*ratio + add")
     p.add_argument("--snr-update-add", type=float, default=60.0, help="update gate (when VAD low): energy >= noise*ratio + add")
     p.add_argument("--speech-hold-ms", type=int, default=300, help="continue tracking this long after VAD drops")
-    p.add_argument("--front-only", action="store_true", default=True)
-    p.add_argument("--no-front-only", action="store_false", dest="front_only")
-    p.add_argument("--use-mirror-branch", action="store_true", default=False, help="use mirrored azimuth candidate (legacy behavior)")
-    p.add_argument("--max-az-deg", type=float, default=60.0)
-    p.add_argument("--az-gain", type=float, default=0.70, help="scale commanded azimuth to reduce over-tilt at extremes")
     p.add_argument("--target-distance-m", type=float, default=1.2)
     p.add_argument("--target-y-m", type=float, default=0.0)
-    p.add_argument("--flip-x", action="store_true", default=True, help="mirror left/right by negating x")
-    p.add_argument("--no-flip-x", action="store_false", dest="flip_x")
     p.add_argument("--hybrid-doa-x-blend", type=float, default=0.20, help="blend DOA x intent into camera user x (0..1)")
     p.add_argument("--hybrid-side-threshold-m", type=float, default=0.08, help="minimum |x| to treat DOA/user side as left/right")
     p.add_argument("--hybrid-no-camera-policy", choices=("hold", "closest-user", "doa"), default="hold")
@@ -333,17 +320,8 @@ def main():
                     qd = float(obs.doa_conf)
                 doa_updated = bool(obs.doa_updated)
                 if doa_updated:
-                    az1, az2 = map_doa_to_az(
-                        doa=doa,
-                        board_cw=a.board_cw,
-                        offset=a.board_zero_offset,
-                        add_180=a.add_180,
-                        front_only=a.front_only,
-                        max_az=a.max_az_deg,
-                    )
+                    az = map_doa_to_az(doa=doa)
                     ref = locked_az if locked_az is not None else (sm_az if sm_az is not None else 0.0)
-                    az_candidates = (az1, az2) if a.use_mirror_branch else (az1,)
-                    az = min(az_candidates, key=lambda t: abs(cdelta(ref, t)))
                     if pending_az is None or abs(cdelta(pending_az, az)) > a.consistency_deg:
                         pending_az = az
                         pending_count = 1
@@ -381,10 +359,9 @@ def main():
                 if time.time() - last_send < min_period: continue
                 doa_available = sm_az is not None
                 if doa_available:
-                    az_cmd = max(-abs(a.max_az_deg), min(abs(a.max_az_deg), float(sm_az) * float(a.az_gain)))
+                    az_cmd = wrap(float(sm_az))
                     ang = math.radians(az_cmd)
                     x = float(a.target_distance_m * math.sin(ang))
-                    if a.flip_x: x = -x
                     y = float(a.target_y_m)
                     z = float(a.target_distance_m * math.cos(ang))
                 else:

@@ -203,11 +203,6 @@ def parse_args() -> argparse.Namespace:
         help="Approximate camera horizontal FOV for bbox-to-bearing mapping.",
     )
     parser.add_argument(
-        "--flip-cnn-bearing",
-        action="store_true",
-        help="Flip sign of estimated bearing before writing fusion JSONL.",
-    )
-    parser.add_argument(
         "--doa-jsonl-live",
         default=None,
         help="Optional live DOA JSONL path for realtime fusion overlay in --show mode.",
@@ -436,13 +431,25 @@ def draw_overlays(frame, outputs, hud: dict | None = None) -> None:
         score_doa = out.get("fusion_doa")
         is_active = bool(out.get("active_speaker"))
         no_speech = bool(out.get("no_speech"))
+        bearing = out.get("bearing_deg")
         if overall is None:
-            label = f"{track_id} cnn:{prob_out:.2f} speak:{int(speak)} ns:{int(no_speech)}"
+            top_lines = [
+                f"{track_id} cnn:{prob_out:.2f}",
+                f"speak:{int(speak)}",
+            ]
+            bottom_lines = [
+                f"a:{int(is_active)}",
+                f"b:{_fmt_float(bearing)}",
+            ]
         else:
-            label = (
-                f"{track_id} c:{float(score_cnn):.2f} d:{float(score_doa):.2f} "
-                f"o:{float(overall):.2f} a:{int(is_active)} ns:{int(no_speech)}"
-            )
+            top_lines = [
+                f"{track_id} c:{float(score_cnn):.2f}",
+                f"d:{float(score_doa):.2f} o:{float(overall):.2f}",
+            ]
+            bottom_lines = [
+                f"a:{int(is_active)} speak:{int(speak)}",
+                f"b:{_fmt_float(bearing)}",
+            ]
         if no_speech:
             color = (0, 0, 255)
         elif is_active:
@@ -455,29 +462,54 @@ def draw_overlays(frame, outputs, hud: dict | None = None) -> None:
             x1, y1, x2, y2 = bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             text_x = x1
-            text_y = max(18, y1 - 6)
-            cv2.putText(
-                frame,
-                label,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-                lineType=cv2.LINE_AA,
-            )
+            line_gap = 20
+            h = frame.shape[0]
+
+            # Two lines above the bbox.
+            top_last_y = max(18, y1 - 6)
+            top_first_y = top_last_y - line_gap * (len(top_lines) - 1)
+            if top_first_y < 18:
+                top_first_y = 18
+            for i, line in enumerate(top_lines):
+                text_y = top_first_y + i * line_gap
+                cv2.putText(
+                    frame,
+                    line,
+                    (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2,
+                    lineType=cv2.LINE_AA,
+                )
+
+            # Two lines below the bbox.
+            bottom_first_y = min(h - 8 - line_gap * (len(bottom_lines) - 1), y2 + line_gap)
+            for i, line in enumerate(bottom_lines):
+                text_y = bottom_first_y + i * line_gap
+                cv2.putText(
+                    frame,
+                    line,
+                    (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2,
+                    lineType=cv2.LINE_AA,
+                )
         else:
-            cv2.putText(
-                frame,
-                label,
-                (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-                lineType=cv2.LINE_AA,
-            )
-            y += 22
+            for line in top_lines + bottom_lines:
+                cv2.putText(
+                    frame,
+                    line,
+                    (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2,
+                    lineType=cv2.LINE_AA,
+                )
+                y += 22
 
 
 def draw_landmark_points(frame, landmarks, indices, color=(0, 255, 0)) -> None:
@@ -541,6 +573,8 @@ def location_to_bearing_deg(location_x: float | None, location_z: float | None) 
         return None
     if abs(location_x) < 1e-6 and abs(location_z) < 1e-6:
         return None
+    # Canonical bearing convention in this project:
+    # front=0, right=+90, left=-90 with +x meaning right.
     return float(np.degrees(np.arctan2(location_x, location_z)))
 
 
@@ -562,14 +596,13 @@ def estimate_user_bearing_deg(
     bbox: tuple[int, int, int, int] | None,
     frame_width: int,
     hfov_deg: float,
-    flip: bool,
 ) -> float | None:
     bearing = location_to_bearing_deg(user.location_x, user.location_z)
     if bearing is None:
         bearing = bbox_to_bearing_deg(bbox, frame_width, hfov_deg)
     if bearing is None:
         return None
-    return float(-bearing if flip else bearing)
+    return float(bearing)
 
 
 def emit_cnn_snapshot(handle, t_value: float, outputs: list[dict]) -> None:
@@ -732,14 +765,18 @@ class FusionOverlayRuntime:
                 out["no_speech"] = False
             return hud
 
-        result = score_users_for_frame(doa_obs=doa_obs, users=users, cfg=self.cfg)
+        result = score_users_for_frame(
+            doa_obs=doa_obs,
+            users=users,
+            cfg=self.cfg,
+        )
         hud["mode"] = "SPEECH_AV"
-        hud["speaker_id"] = result.get("speaker_id")
+        active_id = result.get("speaker_id")
+        hud["speaker_id"] = active_id
         hud["speaker_score"] = result.get("speaker_score")
         hud["weights"] = result.get("weights", hud["weights"])
         hud["doa"] = result.get("doa", hud["doa"])
         score_map = {str(item["user_id"]): item for item in result.get("per_user", [])}
-        active_id = result.get("speaker_id")
         for out in outputs:
             row = score_map.get(str(out["track_id"]))
             if row is None:
@@ -897,7 +934,6 @@ def process_frame(
                         (x1i, y1i, x2i, y2i),
                         frame_w,
                         args.camera_hfov_deg,
-                        args.flip_cnn_bearing,
                     ),
                 )
             )

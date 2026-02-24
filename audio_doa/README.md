@@ -116,7 +116,6 @@ Each frame is one JSON line:
   "speech_detected": true,
   "speech_active": true,
   "speech_ended": false,
-  "allow_update": true,
   "doa_updated": true
 }
 ```

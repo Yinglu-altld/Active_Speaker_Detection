@@ -46,7 +46,13 @@ def _doa_score(
     if azimuth_deg is None:
         return 0.0, 180.0
     sigma = cfg.default_sigma_deg if sigma_deg is None else max(cfg.min_sigma_deg, float(sigma_deg))
-    delta = _angle_diff_deg(float(azimuth_deg), float(user_bearing_deg))
+    az0 = float(azimuth_deg)
+    az1 = _wrap_deg(az0 + 180.0)
+    # Resolve front/back ambiguity by taking the hemisphere closer to the user bearing.
+    delta = min(
+        _angle_diff_deg(az0, float(user_bearing_deg)),
+        _angle_diff_deg(az1, float(user_bearing_deg)),
+    )
     align = math.exp(-0.5 * (delta / sigma) ** 2)
     return float(align), delta
 
@@ -92,31 +98,53 @@ def score_users_for_frame(
     users: Iterable[UserEvidence],
     cfg: FusionConfig = FusionConfig(),
 ) -> dict:
+    users = list(users)
     azimuth_deg = doa_obs.get("azimuth_deg")
     sigma_deg = doa_obs.get("sigma_deg")
+    entropy = doa_obs.get("entropy")
     conf_doa = _clip01(float(doa_obs.get("conf_doa") or 0.0))
     conf_doa_srp = _clip01(float(doa_obs.get("conf_doa_srp") or 0.0))
     audio_conf = _clip01(float(doa_obs.get("audio_conf") or 0.0))
     reliability = _clip01(0.6 * conf_doa_srp + 0.4 * audio_conf)
-    w_doa = _clip01(float(cfg.fixed_doa_weight))
+    doa_available = azimuth_deg is not None
+    sigma_f = None if sigma_deg is None else float(sigma_deg)
+
+    # Constant DOA weight whenever azimuth is available.
+    if doa_available:
+        w_doa = _clip01(float(cfg.fixed_doa_weight))
+    else:
+        w_doa = 0.0
     w_cnn = 1.0 - w_doa
+
+    sigma_used = sigma_f
 
     per_user = []
     for user in users:
         s_cnn = _cnn_score(user)
         s_doa, delta_deg = _doa_score(
-            azimuth_deg=float(azimuth_deg) if azimuth_deg is not None else None,
-            sigma_deg=float(sigma_deg) if sigma_deg is not None else None,
+            azimuth_deg=float(azimuth_deg) if doa_available and azimuth_deg is not None else None,
+            sigma_deg=sigma_used,
             user_bearing_deg=float(user.bearing_deg),
             cfg=cfg,
         )
-        score = w_cnn * s_cnn + w_doa * s_doa
+        if w_doa <= 0.0:
+            s_doa = 0.0
+        mix = w_cnn * s_cnn + w_doa * s_doa
+        score = mix
+        part_cnn = w_cnn * s_cnn
+        part_doa = w_doa * s_doa
+        floor_applied = False
         per_user.append(
             {
                 "user_id": user.user_id,
                 "score": float(score),
                 "score_cnn": float(s_cnn),
                 "score_doa": float(s_doa),
+                "part_cnn": float(part_cnn),
+                "part_doa": float(part_doa),
+                "mix_score": float(mix),
+                "doa_used": bool(part_doa > 1e-6),
+                "floor_applied": bool(floor_applied),
                 "delta_deg": float(delta_deg),
                 "bearing_deg": float(user.bearing_deg),
             }
@@ -135,7 +163,9 @@ def score_users_for_frame(
             "conf_doa_srp": conf_doa_srp,
             "audio_conf": audio_conf,
             "sigma_deg": sigma_deg,
+            "entropy": entropy,
             "reliability": float(reliability),
+            "valid_for_fusion": bool(doa_available),
         },
         "per_user": per_user,
     }
