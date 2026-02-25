@@ -344,7 +344,7 @@ def _handle_user_attend(
     if top_id is None:
         _reset_attend_state(state)
         return
-    use_min_score = mode == "SPEECH_AV"
+    use_min_score = mode in ("SPEECH_AV", "SPEECH_CNN_ONLY")
     if use_min_score and top_score < float(min_speaker_score):
         _reset_attend_state(state)
         return
