@@ -99,13 +99,19 @@ You only need to provide extra data files such as `data/videos/*.mp4` and `data/
 
 Use `run_live_fusion.py` as the single entrypoint. Furhat head control is enabled by default.
 
-### 3.1 Baseline live fusion (recommended first run)
+### 3.1 Calibrated live fusion (current recommended run)
 
 ```bash
 ./venv/bin/python audio_doa/run_live_fusion.py \
+  --cnn-source furhat \
   --furhat-ip 192.168.1.108 \
   --audio-device 1 --audio-channels 6 --mic-channels 1,2,3,4 \
-  --step6-extra "--show --window-width 960 --window-height 540"
+  --doa-azimuth-sign 1 --doa-azimuth-offset-deg -160 \
+  --speech-hold-sec 0.45 --min-speaker-score 0.15 \
+  --doa-attend-min-reliability 0.12 --doa-attend-min-delta-deg 6 \
+  --doa-extra "--frame-ms 60 --vad-mic 0 --vad-threshold 0.12 --vad-smooth-alpha 0.40 --speech-hold-ms 420 --srp-f-low-hz 100 --srp-f-high-hz 3200 --doa-smooth-alpha-min 0.10 --doa-smooth-alpha-max 0.35 --doa-smooth-max-step-deg 12" \
+  --step6-extra "--show --window-width 960 --window-height 540 --max-faces 3" \
+  --show-child-logs
 ```
 
 ### 3.2 Pause-tolerant live fusion (reduce head jitter during natural pauses)

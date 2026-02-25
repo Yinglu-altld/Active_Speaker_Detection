@@ -15,10 +15,10 @@ except ImportError:
 _MIC_R = 0.028 / np.sqrt(2.0)
 MIC_XY = np.array(
     [
-        [_MIC_R, _MIC_R],    # mic1 (front-right)
-        [_MIC_R, -_MIC_R],   # mic2 (front-left)
-        [-_MIC_R, -_MIC_R],  # mic3 (back-left)
-        [-_MIC_R, _MIC_R],   # mic4 (back-right)
+        [_MIC_R, -_MIC_R],   # mic1 (front-left, user frame)
+        [_MIC_R, _MIC_R],    # mic2 (front-right, user frame)
+        [-_MIC_R, _MIC_R],   # mic3 (back-right, user frame)
+        [-_MIC_R, -_MIC_R],  # mic4 (back-left, user frame)
     ],
     dtype=np.float64,
 )

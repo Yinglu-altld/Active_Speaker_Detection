@@ -11,18 +11,19 @@ except ImportError:
     from srp_phat import SRPPhatDOA
 
 
-# Canonical DOA frame:
-#   0 deg   -> midpoint between mic1 and mic2 (front)
-#   +90 deg -> right side of board
-#   -90 deg -> left side of board
+# Canonical DOA frame (user-facing):
+#   User stands facing the ReSpeaker board.
+#   0 deg   -> front (toward user), midpoint between mic1 and mic2
+#   +90 deg -> user's right side (mic2/mic3 side)
+#   -90 deg -> user's left side  (mic1/mic4 side)
 # Mic ordering here is logical mic1..mic4.
 _MIC_R = 0.028 / np.sqrt(2.0)
 MIC_XY = np.array(
     [
-        [_MIC_R, _MIC_R],    # mic1 (front-right)
-        [_MIC_R, -_MIC_R],   # mic2 (front-left)
-        [-_MIC_R, -_MIC_R],  # mic3 (back-left)
-        [-_MIC_R, _MIC_R],   # mic4 (back-right)
+        [_MIC_R, -_MIC_R],   # mic1 (front-left, user frame)
+        [_MIC_R, _MIC_R],    # mic2 (front-right, user frame)
+        [-_MIC_R, _MIC_R],   # mic3 (back-right, user frame)
+        [-_MIC_R, -_MIC_R],  # mic4 (back-left, user frame)
     ],
     dtype=np.float64,
 )
