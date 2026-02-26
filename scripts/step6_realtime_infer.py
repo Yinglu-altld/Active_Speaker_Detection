@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import base64
 import json
+import math
 import os
 import sys
 import time
@@ -252,6 +253,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-width", type=int, default=960)
     parser.add_argument("--window-height", type=int, default=540)
     parser.add_argument(
+        "--score-plot",
+        action="store_true",
+        default=True,
+        help="Show raw CNN/DOA score plot in the realtime UI.",
+    )
+    parser.add_argument(
+        "--no-score-plot",
+        action="store_false",
+        dest="score_plot",
+        help="Disable raw CNN/DOA score plot in the realtime UI.",
+    )
+    parser.add_argument(
+        "--score-plot-window-sec",
+        type=float,
+        default=12.0,
+        help="History span (seconds) for the raw CNN/DOA score plot.",
+    )
+    parser.add_argument(
         "--no-draw-landmarks",
         dest="draw_landmarks",
         action="store_false",
@@ -404,6 +423,133 @@ def _fmt_float(value) -> str:
         return f"{float(value):.2f}"
     except (TypeError, ValueError):
         return "-"
+
+
+def _clip01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _wrap_angle_deg(angle_deg: float) -> float:
+    return ((float(angle_deg) + 180.0) % 360.0) - 180.0
+
+
+def _render_score_plot_frame(
+    plot_payload: dict | None,
+    width: int = 420,
+    height: int = 220,
+) -> np.ndarray:
+    canvas = np.zeros((int(height), int(width), 3), dtype=np.uint8)
+    canvas[:, :] = (20, 20, 20)
+    cv2.rectangle(canvas, (0, 0), (width - 1, height - 1), (70, 70, 70), 1)
+
+    points = [] if not plot_payload else list(plot_payload.get("points") or [])
+    chart_l = 10
+    chart_r = width - 10
+    chart_t = 44
+    chart_b = height - 16
+    chart_w = max(1, chart_r - chart_l)
+    chart_h = max(1, chart_b - chart_t)
+    cv2.rectangle(canvas, (chart_l, chart_t), (chart_r, chart_b), (45, 45, 45), 1)
+
+    doa_stale = bool(plot_payload and plot_payload.get("doa_stale"))
+    doa_color = (95, 95, 95) if doa_stale else (0, 200, 255)
+    doa_text_color = (150, 150, 150) if doa_stale else (0, 200, 255)
+    if len(points) >= 2:
+        def _draw_series(key: str, color: tuple[int, int, int]) -> None:
+            segment: list[tuple[int, int]] = []
+            n_points = len(points)
+            for idx, item in enumerate(points):
+                value = item.get(key)
+                if value is None:
+                    if len(segment) >= 2:
+                        cv2.polylines(
+                            canvas,
+                            [np.array(segment, dtype=np.int32)],
+                            isClosed=False,
+                            color=color,
+                            thickness=2,
+                            lineType=cv2.LINE_AA,
+                        )
+                    segment = []
+                    continue
+                x = int(chart_l + (idx / max(1, n_points - 1)) * chart_w)
+                y = int(chart_b - _clip01(float(value)) * chart_h)
+                segment.append((x, y))
+            if len(segment) >= 2:
+                cv2.polylines(
+                    canvas,
+                    [np.array(segment, dtype=np.int32)],
+                    isClosed=False,
+                    color=color,
+                    thickness=2,
+                    lineType=cv2.LINE_AA,
+                )
+
+        _draw_series("cnn", (0, 220, 0))
+        _draw_series("doa", doa_color)
+    else:
+        cv2.putText(
+            canvas,
+            "waiting for score history...",
+            (14, int((chart_t + chart_b) * 0.5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (180, 180, 180),
+            1,
+            lineType=cv2.LINE_AA,
+        )
+
+    target_id = None if not plot_payload else plot_payload.get("track_id")
+    latest_cnn = None if not plot_payload else plot_payload.get("cnn")
+    latest_doa = None if not plot_payload else plot_payload.get("doa")
+    doa_age_sec = None if not plot_payload else plot_payload.get("doa_age_sec")
+    legend = (
+        f"raw plot id:{target_id if target_id is not None else '-'} "
+        f"cnn:{_fmt_float(latest_cnn)} doa:{_fmt_float(latest_doa)}"
+    )
+    cv2.putText(
+        canvas,
+        legend,
+        (10, 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.46,
+        (220, 220, 220),
+        1,
+        lineType=cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "cnn(raw)",
+        (10, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        (0, 220, 0),
+        1,
+        lineType=cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "doa(raw stale)" if doa_stale else "doa(raw)",
+        (88, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        doa_text_color,
+        1,
+        lineType=cv2.LINE_AA,
+    )
+    if doa_age_sec is not None:
+        age_color = (120, 120, 255) if doa_stale else (190, 190, 190)
+        cv2.putText(
+            canvas,
+            f"doa_age:{_fmt_float(doa_age_sec)}s",
+            (width - 140, 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            age_color,
+            1,
+            lineType=cv2.LINE_AA,
+        )
+    return canvas
 
 
 def _draw_status_hud(frame, hud: dict | None) -> None:
@@ -715,7 +861,13 @@ class LiveDOASnapshots:
             return None
         if abs(float(t_value) - float(t_obs)) > float(max_staleness_sec):
             return None
-        return self.latest
+        return dict(self.latest)
+
+    def latest_snapshot(self):
+        self.poll()
+        if self.latest is None:
+            return None
+        return dict(self.latest)
 
 
 class FusionOverlayRuntime:
@@ -734,9 +886,115 @@ class FusionOverlayRuntime:
             fixed_doa_weight=0.35,
         )
         self.overlay_gate_speak_by_audio = bool(args.overlay_gate_speak_by_audio)
+        self.score_plot_enabled = bool(args.score_plot)
+        self.score_plot_window_sec = max(2.0, float(args.score_plot_window_sec))
+        self.score_plot_history = deque()
+
+    def _select_plot_target(self, outputs: list[dict], preferred_id: str | None):
+        if not outputs:
+            return None
+        if preferred_id is not None:
+            for out in outputs:
+                if str(out.get("track_id")) == str(preferred_id):
+                    return out
+        return max(outputs, key=lambda item: float(item.get("prob") or 0.0))
+
+    def _raw_doa_plot_score(self, doa_obs: dict | None, bearing_deg: float | None) -> float | None:
+        if doa_obs is None or bearing_deg is None:
+            return None
+        azimuth_deg = doa_obs.get("azimuth_deg")
+        if azimuth_deg is None:
+            return None
+        sigma_deg = doa_obs.get("sigma_deg")
+        if sigma_deg is None:
+            sigma = float(self.cfg.default_sigma_deg)
+        else:
+            sigma = max(float(self.cfg.min_sigma_deg), float(sigma_deg))
+        delta = abs(_wrap_angle_deg(float(azimuth_deg) - float(bearing_deg)))
+        return float(math.exp(-0.5 * (delta / max(1e-6, sigma)) ** 2))
+
+    def _append_score_plot_point(
+        self,
+        t_value: float,
+        outputs: list[dict],
+        preferred_id: str | None,
+        doa_plot_obs: dict | None,
+    ) -> None:
+        if not self.score_plot_enabled:
+            return
+        target = self._select_plot_target(outputs, preferred_id)
+        track_id = None if target is None else str(target.get("track_id"))
+        cnn_raw = None if target is None else _clip01(float(target.get("prob") or 0.0))
+        bearing = None if target is None else target.get("bearing_deg")
+        doa_raw = self._raw_doa_plot_score(doa_plot_obs, bearing)
+
+        doa_t = None
+        doa_rel = None
+        if doa_plot_obs is not None:
+            t_obs = doa_plot_obs.get("t")
+            if t_obs is not None:
+                try:
+                    doa_t = float(t_obs)
+                except (TypeError, ValueError):
+                    doa_t = None
+            doa_rel = 0.6 * float(doa_plot_obs.get("conf_doa_srp") or 0.0) + 0.4 * float(
+                doa_plot_obs.get("audio_conf") or 0.0
+            )
+            doa_rel = _clip01(doa_rel)
+
+        self.score_plot_history.append(
+            {
+                "t": float(t_value),
+                "track_id": track_id,
+                "cnn": cnn_raw,
+                "doa": doa_raw,
+                "doa_t": doa_t,
+                "doa_reliability": doa_rel,
+            }
+        )
+        cutoff = float(t_value) - float(self.score_plot_window_sec)
+        while self.score_plot_history and float(self.score_plot_history[0]["t"]) < cutoff:
+            self.score_plot_history.popleft()
+
+    def _attach_score_plot(self, hud: dict, t_value: float) -> dict:
+        if not self.score_plot_enabled or not self.score_plot_history:
+            return hud
+        latest = self.score_plot_history[-1]
+        doa_age_sec = None
+        doa_t = latest.get("doa_t")
+        if doa_t is not None:
+            doa_age_sec = max(0.0, float(t_value) - float(doa_t))
+        stale_threshold_sec = float(self.max_staleness_sec)
+        doa_stale = True if doa_age_sec is None else doa_age_sec > stale_threshold_sec
+        hud["score_plot"] = {
+            "track_id": latest.get("track_id"),
+            "cnn": latest.get("cnn"),
+            "doa": latest.get("doa"),
+            "doa_reliability": latest.get("doa_reliability"),
+            "doa_age_sec": doa_age_sec,
+            "doa_stale": bool(doa_stale),
+            "doa_stale_threshold_sec": stale_threshold_sec,
+            "points": [
+                {
+                    "cnn": item.get("cnn"),
+                    "doa": item.get("doa"),
+                }
+                for item in self.score_plot_history
+            ],
+        }
+        return hud
 
     def annotate_outputs(self, outputs: list[dict], t_value: float) -> dict:
-        doa_obs = self.live_doa.get_for_time(t_value=t_value, max_staleness_sec=self.max_staleness_sec)
+        doa_plot_obs = self.live_doa.latest_snapshot()
+        doa_obs = None
+        if doa_plot_obs is not None:
+            t_obs = doa_plot_obs.get("t")
+            if t_obs is not None:
+                try:
+                    if abs(float(t_value) - float(t_obs)) <= float(self.max_staleness_sec):
+                        doa_obs = doa_plot_obs
+                except (TypeError, ValueError):
+                    doa_obs = None
         for out in outputs:
             out["visual_speak"] = bool(out.get("speak", False))
         hud = {
@@ -764,7 +1022,8 @@ class FusionOverlayRuntime:
                 out["no_speech"] = False
                 if self.overlay_gate_speak_by_audio:
                     out["speak"] = False
-            return hud
+            self._append_score_plot_point(t_value, outputs, None, doa_plot_obs)
+            return self._attach_score_plot(hud, t_value)
 
         speech_active = bool(doa_obs.get("speech_active") or doa_obs.get("speech_detected"))
         if not speech_active:
@@ -777,7 +1036,8 @@ class FusionOverlayRuntime:
                 out["no_speech"] = True
                 if self.overlay_gate_speak_by_audio:
                     out["speak"] = False
-            return hud
+            self._append_score_plot_point(t_value, outputs, None, doa_plot_obs)
+            return self._attach_score_plot(hud, t_value)
 
         users = []
         for out in outputs:
@@ -806,7 +1066,8 @@ class FusionOverlayRuntime:
                 out["fusion_doa"] = 0.0
                 out["active_speaker"] = False
                 out["no_speech"] = False
-            return hud
+            self._append_score_plot_point(t_value, outputs, hud.get("speaker_id"), doa_plot_obs)
+            return self._attach_score_plot(hud, t_value)
 
         result = score_users_for_frame(
             doa_obs=doa_obs,
@@ -834,7 +1095,8 @@ class FusionOverlayRuntime:
             out["fusion_doa"] = float(row["score_doa"])
             out["active_speaker"] = str(out["track_id"]) == str(active_id)
             out["no_speech"] = False
-        return hud
+        self._append_score_plot_point(t_value, outputs, str(active_id) if active_id is not None else None, doa_plot_obs)
+        return self._attach_score_plot(hud, t_value)
 
 
 def process_frame(
@@ -904,6 +1166,8 @@ def process_frame(
                 print_state["last_print"] = int(now)
                 print("no users")
             if args.show:
+                if args.score_plot:
+                    cv2.imshow("score_plot_raw", _render_score_plot_frame(None))
                 cv2.imshow("vvad_realtime", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     return False
@@ -1004,6 +1268,9 @@ def process_frame(
 
     if args.show:
         draw_overlays(frame, outputs, hud)
+        if args.score_plot:
+            plot_payload = None if hud is None else hud.get("score_plot")
+            cv2.imshow("score_plot_raw", _render_score_plot_frame(plot_payload))
         cv2.imshow("vvad_realtime", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             return False
@@ -1251,6 +1518,9 @@ def main() -> None:
             max(320, int(args.window_width)),
             max(240, int(args.window_height)),
         )
+        if args.score_plot:
+            cv2.namedWindow("score_plot_raw", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("score_plot_raw", 420, 220)
     cnn_jsonl_handle = None
     if args.emit_cnn_jsonl:
         cnn_jsonl_handle = open(args.emit_cnn_jsonl, "a", encoding="utf-8", buffering=1)

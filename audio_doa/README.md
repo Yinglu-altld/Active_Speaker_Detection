@@ -194,8 +194,21 @@ In the Step6 window, each bbox shows:
 - `d`: DOA score for that user
 - `o`: overall fused score
 - `a`: active speaker flag (`1` active, `0` inactive)
+- separate `score_plot_raw` window: raw `cnn` and raw per-user `doa` history (UI-only, not used for fusion decisions)
 
 Active speaker bbox is green; other fused users are orange.
+
+Raw chart behavior:
+- `cnn(raw)` is the model probability for the plotted user.
+- `doa(raw)` is geometric alignment from latest DOA azimuth + sigma and user bearing.
+- chart values are display-only and are not gated by fusion speech/VAD decisions.
+- when DOA age exceeds `--max-doa-staleness-sec`, the DOA trace is grayed and marked `stale`.
+
+Chart options:
+
+```powershell
+python ../scripts/step6_realtime_infer.py --source furhat --model-dir ../data/models/cnn_vvad --show --score-plot --score-plot-window-sec 12
+```
 
 You can tune audio device quickly:
 

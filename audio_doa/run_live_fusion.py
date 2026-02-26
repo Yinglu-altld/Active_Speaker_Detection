@@ -338,6 +338,8 @@ def _build_step6_cmd(args: argparse.Namespace) -> list[str]:
         str(args.min_doa_reliability_for_fusion),
         "--fusion-doa-reliability-gamma",
         str(args.doa_reliability_gamma),
+        "--max-doa-staleness-sec",
+        str(args.max_doa_staleness_sec),
     ]
     if args.cnn_source == "furhat":
         cmd.extend(["--furhat-ip", args.furhat_ip])
