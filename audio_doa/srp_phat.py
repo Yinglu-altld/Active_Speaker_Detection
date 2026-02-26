@@ -1,7 +1,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -106,9 +106,7 @@ class SRPPhatDOA:
         else:
             second = 0.0
         mean = float(np.mean(scores)) + 1e-12
-        sharpness = max(0.0, min(1.0, (best - second) / (best + 1e-12)))
         contrast = max(0.0, min(1.0, (best - mean) / (best + 1e-12)))
-        entropy = _entropy01(scores)
         if self.az_grid.size > 1:
             step_deg = float(self.az_grid[1] - self.az_grid[0])
         else:
@@ -116,34 +114,20 @@ class SRPPhatDOA:
         sigma_deg = _half_max_sigma(scores, best_idx, step_deg)
         peak_ratio = best / (second + 1e-12)
         peak_ratio_score = max(0.0, min(1.0, 1.0 - math.exp(-max(0.0, peak_ratio - 1.0))))
-        entropy_score = 1.0 - entropy
         sigma_score = 0.0 if sigma_deg is None else max(0.0, min(1.0, math.exp(-sigma_deg / 25.0)))
         confidence = max(
             0.0,
             min(
                 1.0,
-                0.35 * peak_ratio_score
-                + 0.25 * contrast
-                + 0.20 * entropy_score
+                0.45 * peak_ratio_score
+                + 0.35 * contrast
                 + 0.20 * sigma_score,
             ),
         )
-        conf_components = {
-            "peak_ratio_score": float(peak_ratio_score),
-            "contrast_score": float(contrast),
-            "entropy_score": float(entropy_score),
-            "sigma_score": float(sigma_score),
-            "sharpness_score": float(sharpness),
-            "peak_ratio_raw": float(peak_ratio),
-        }
-        peaks = _top_peaks(scores, self.az_grid, k=3)
         return DOAResult(
             doa_deg=doa_deg,
             conf=confidence,
             sigma_deg=sigma_deg,
-            peaks=peaks,
-            entropy=entropy,
-            conf_components=conf_components,
         )
 
 
@@ -152,20 +136,6 @@ class DOAResult:
     doa_deg: float
     conf: float
     sigma_deg: Optional[float]
-    peaks: List[dict]
-    entropy: float
-    conf_components: Dict[str, float]
-
-
-def _entropy01(scores: np.ndarray) -> float:
-    total = float(np.sum(scores))
-    if total <= 0.0 or scores.size == 0:
-        return 1.0
-    if scores.size == 1:
-        return 0.0
-    p = scores / total
-    h = float(-np.sum(p * np.log(p + 1e-12)))
-    return max(0.0, min(1.0, h / math.log(scores.size)))
 
 
 def _half_max_sigma(scores: np.ndarray, best_idx: int, step_deg: float) -> Optional[float]:
@@ -186,23 +156,3 @@ def _half_max_sigma(scores: np.ndarray, best_idx: int, step_deg: float) -> Optio
     return width_deg / 2.355
 
 
-def _top_peaks(scores: np.ndarray, az_grid: np.ndarray, k: int = 3) -> List[dict]:
-    if scores.size == 0:
-        return []
-    k = max(1, min(int(k), scores.size))
-    idx = np.argpartition(scores, -k)[-k:]
-    idx = idx[np.argsort(scores[idx])[::-1]]
-    total = float(np.sum(scores)) + 1e-12
-    best = float(np.max(scores)) + 1e-12
-    peaks = []
-    for i in idx:
-        s = float(scores[int(i)])
-        peaks.append(
-            {
-                "azimuth_deg": float(az_grid[int(i)]),
-                "score": s,
-                "score_norm": float(s / best),
-                "score_prob": float(s / total),
-            }
-        )
-    return peaks

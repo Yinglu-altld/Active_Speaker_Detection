@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import os
 import shlex
 import subprocess
 import sys
@@ -23,6 +24,25 @@ except ImportError:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_STEP6_EXTRA = (
+    "--show --window-width 960 --window-height 540 --max-faces 3 --camera-hfov-deg 60"
+)
+DEFAULT_DOA_EXTRA = (
+    "--frame-ms 60 --vad-mic 0 --vad-threshold 0.12 --srp-f-low-hz 100 --srp-f-high-hz 3200"
+)
+
+
+def _ensure_no_proxy(host: str | None) -> None:
+    if not host:
+        return
+    existing = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    entries = [item.strip() for item in existing.split(",") if item.strip()]
+    if host not in entries:
+        entries.append(str(host))
+    value = ",".join(entries) if entries else str(host)
+    os.environ["NO_PROXY"] = value
+    os.environ["no_proxy"] = value
 
 
 class FurhatWS:
@@ -157,6 +177,8 @@ class AttendState:
     pending_hits: int = 0
     last_send_ts: float = 0.0
     last_doa_azimuth: float | None = None
+    pending_doa_azimuth: float | None = None
+    pending_doa_hits: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -180,30 +202,47 @@ def parse_args() -> argparse.Namespace:
         choices=["furhat", "opencv", "file", "stream"],
         default="furhat",
     )
-    parser.add_argument("--furhat-ip", default="192.168.1.109")
+    parser.add_argument("--furhat-ip", default="192.168.1.108")
     parser.add_argument("--furhat-auth", default=None)
     parser.add_argument(
         "--model-dir",
         default=str(PROJECT_ROOT / "data" / "models" / "cnn_vvad"),
     )
-    parser.add_argument("--step6-extra", action="append", default=[])
+    parser.add_argument("--step6-extra", action="append", default=None)
 
     parser.add_argument("--audio-device", type=int, default=1)
     parser.add_argument("--audio-channels", type=int, default=6)
     parser.add_argument("--mic-channels", default="1,2,3,4")
     parser.add_argument("--doa-azimuth-sign", type=int, choices=[-1, 1], default=1)
-    parser.add_argument("--doa-azimuth-offset-deg", type=float, default=0.0)
-    parser.add_argument("--doa-extra", action="append", default=[])
+    parser.add_argument("--doa-azimuth-offset-deg", type=float, default=10.0)
+    parser.add_argument("--doa-extra", action="append", default=None)
 
     parser.add_argument("--max-cnn-staleness-sec", type=float, default=0.8)
-    parser.add_argument("--max-doa-staleness-sec", type=float, default=0.8)
-    parser.add_argument("--speech-hold-sec", type=float, default=0.6)
+    parser.add_argument("--max-doa-staleness-sec", type=float, default=0.35)
+    parser.add_argument("--speech-hold-sec", type=float, default=0.45)
     parser.add_argument("--tick-hz", type=float, default=12.0)
+    parser.add_argument(
+        "--max-runtime-sec",
+        type=float,
+        default=None,
+        help="Optional wall-clock limit for smoke tests (seconds).",
+    )
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--json-output", action="store_true")
 
     parser.add_argument("--default-sigma-deg", type=float, default=25.0)
     parser.add_argument("--min-sigma-deg", type=float, default=8.0)
+    parser.add_argument("--max-sigma-deg", type=float, default=45.0)
+    parser.add_argument("--sigma-trust-decay-deg", type=float, default=30.0)
+    parser.add_argument("--min-align-gap", type=float, default=0.20)
+    parser.add_argument("--doa-delta-hard-gate-deg", type=float, default=85.0)
+    parser.add_argument("--min-doa-reliability-for-fusion", type=float, default=0.05)
+    parser.add_argument(
+        "--doa-reliability-gamma",
+        type=float,
+        default=0.65,
+        help="Shape for continuous DOA reliability weighting (lower => stronger DOA at low reliability).",
+    )
 
     parser.add_argument(
         "--attend-furhat",
@@ -224,11 +263,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slack-pitch", type=float, default=15.0)
     parser.add_argument("--slack-yaw", type=float, default=10.0)
     parser.add_argument("--slack-timeout", type=int, default=3000)
-    parser.add_argument("--min-speaker-score", type=float, default=0.30)
+    parser.add_argument("--min-speaker-score", type=float, default=0.15)
     parser.add_argument(
         "--av-doa-hold-sec",
         type=float,
-        default=1.2,
+        default=0.25,
         help="Allow using slightly stale DOA for AV association to reduce CNN-only flicker.",
     )
     parser.add_argument("--switch-hits", type=int, default=3)
@@ -239,7 +278,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--doa-attend-min-reliability",
         type=float,
-        default=0.14,
+        default=0.12,
         help="Minimum DOA reliability required before sending attend.location.",
     )
     parser.add_argument(
@@ -248,6 +287,32 @@ def parse_args() -> argparse.Namespace:
         default=6.0,
         help="Minimum azimuth change required before sending another attend.location.",
     )
+    parser.add_argument(
+        "--doa-attend-startup-hits",
+        type=int,
+        default=3,
+        help="Consecutive DOA hits required before sending DOA-only attend.location.",
+    )
+    parser.add_argument(
+        "--doa-attend-consensus-deg",
+        type=float,
+        default=14.0,
+        help="Max azimuth spread for consecutive DOA hits to count toward startup hits.",
+    )
+    parser.add_argument(
+        "--doa-attend-front-only",
+        action="store_true",
+        default=True,
+        help="Restrict DOA-only attend.location to front sector.",
+    )
+    parser.add_argument(
+        "--no-doa-attend-front-only",
+        action="store_false",
+        dest="doa_attend_front_only",
+        help="Allow DOA-only attend.location across full 360 degrees.",
+    )
+    parser.add_argument("--doa-attend-front-min-deg", type=float, default=-85.0)
+    parser.add_argument("--doa-attend-front-max-deg", type=float, default=85.0)
 
     parser.add_argument("--show-child-logs", action="store_true")
     return parser.parse_args()
@@ -265,12 +330,21 @@ def _build_step6_cmd(args: argparse.Namespace) -> list[str]:
         args.cnn_jsonl_live,
         "--doa-jsonl-live",
         args.doa_jsonl_live,
+        "--fusion-default-sigma-deg",
+        str(args.default_sigma_deg),
+        "--fusion-min-sigma-deg",
+        str(args.min_sigma_deg),
+        "--fusion-min-doa-reliability",
+        str(args.min_doa_reliability_for_fusion),
+        "--fusion-doa-reliability-gamma",
+        str(args.doa_reliability_gamma),
     ]
     if args.cnn_source == "furhat":
         cmd.extend(["--furhat-ip", args.furhat_ip])
         if args.furhat_auth:
             cmd.extend(["--furhat-auth", args.furhat_auth])
-    for extra in args.step6_extra:
+    step6_extra = args.step6_extra if args.step6_extra else [DEFAULT_STEP6_EXTRA]
+    for extra in step6_extra:
         cmd.extend(shlex.split(extra))
     return cmd
 
@@ -291,7 +365,8 @@ def _build_doa_cmd(args: argparse.Namespace) -> list[str]:
         str(args.doa_azimuth_offset_deg),
         "--no-emit-idle",
     ]
-    for extra in args.doa_extra:
+    doa_extra = args.doa_extra if args.doa_extra else [DEFAULT_DOA_EXTRA]
+    for extra in doa_extra:
         cmd.extend(shlex.split(extra))
     return cmd
 
@@ -363,7 +438,24 @@ def _inject_cnn_payload_with_doa(payload: dict, doa_obs: dict | None, cfg: Fusio
         return payload
     out = dict(payload)
     doa = dict(out.get("doa") or {})
-    az = float(doa_obs.get("azimuth_deg"))
+    az_raw = float(doa_obs.get("azimuth_deg"))
+    az = _wrap_deg(az_raw)
+    az_alt = _wrap_deg(az + 180.0)
+    per_user_src = out.get("per_user", [])
+    if per_user_src:
+        cost0 = 0.0
+        cost1 = 0.0
+        for item in per_user_src:
+            if not isinstance(item, dict):
+                continue
+            try:
+                bearing = float(item.get("bearing_deg"))
+            except (TypeError, ValueError):
+                continue
+            cost0 += abs(_wrap_deg(az - bearing))
+            cost1 += abs(_wrap_deg(az_alt - bearing))
+        if cost1 < cost0:
+            az = az_alt
     sigma_val = doa_obs.get("sigma_deg")
     if sigma_val is None:
         sigma = float(cfg.default_sigma_deg)
@@ -372,6 +464,7 @@ def _inject_cnn_payload_with_doa(payload: dict, doa_obs: dict | None, cfg: Fusio
     doa.update(
         {
             "azimuth_deg": az,
+            "azimuth_raw_deg": az_raw,
             "conf_doa": float(doa_obs.get("conf_doa") or 0.0),
             "conf_doa_srp": float(doa_obs.get("conf_doa_srp") or 0.0),
             "audio_conf": float(doa_obs.get("audio_conf") or 0.0),
@@ -388,8 +481,7 @@ def _inject_cnn_payload_with_doa(payload: dict, doa_obs: dict | None, cfg: Fusio
         row = dict(item)
         try:
             bearing = float(row.get("bearing_deg"))
-            az_alt = _wrap_deg(az + 180.0)
-            delta = min(abs(_wrap_deg(az - bearing)), abs(_wrap_deg(az_alt - bearing)))
+            delta = abs(_wrap_deg(az - bearing))
             row["delta_deg"] = float(delta)
             row["score_doa"] = float(math.exp(-0.5 * (delta / max(1e-6, sigma)) ** 2))
         except (TypeError, ValueError):
@@ -425,6 +517,17 @@ def _reset_attend_state(state: AttendState) -> None:
     state.pending_speaker = None
     state.pending_hits = 0
     state.last_doa_azimuth = None
+    state.pending_doa_azimuth = None
+    state.pending_doa_hits = 0
+
+
+def _angle_in_sector(angle_deg: float, min_deg: float, max_deg: float) -> bool:
+    angle = _wrap_deg(float(angle_deg))
+    lo = _wrap_deg(float(min_deg))
+    hi = _wrap_deg(float(max_deg))
+    if lo <= hi:
+        return lo <= angle <= hi
+    return angle >= lo or angle <= hi
 
 
 def _handle_user_attend(
@@ -491,25 +594,66 @@ def _handle_doa_attend(
     y_m: float,
     min_reliability: float,
     min_delta_deg: float,
+    startup_hits: int,
+    consensus_deg: float,
+    front_only: bool,
+    front_min_deg: float,
+    front_max_deg: float,
 ) -> None:
     azimuth = doa_obs.get("azimuth_deg")
     if azimuth is None:
         return
     reliability = float(doa_obs.get("reliability") or 0.0)
     if reliability < float(min_reliability):
-        return
-    if now_ts - state.last_send_ts < min_send_period:
+        state.pending_doa_azimuth = None
+        state.pending_doa_hits = 0
         return
     az = float(azimuth)
+    if bool(front_only) and not _angle_in_sector(
+        angle_deg=az,
+        min_deg=float(front_min_deg),
+        max_deg=float(front_max_deg),
+    ):
+        state.pending_doa_azimuth = None
+        state.pending_doa_hits = 0
+        return
+
+    consensus = max(0.0, float(consensus_deg))
+    if state.pending_doa_azimuth is None:
+        state.pending_doa_azimuth = az
+        state.pending_doa_hits = 1
+        return
+
+    pending = float(state.pending_doa_azimuth)
+    if abs(_wrap_deg(az - pending)) <= consensus:
+        blend = 0.45
+        pending = _wrap_deg(pending + blend * _wrap_deg(az - pending))
+        state.pending_doa_azimuth = pending
+        state.pending_doa_hits += 1
+    else:
+        state.pending_doa_azimuth = az
+        state.pending_doa_hits = 1
+        return
+
+    min_hits = max(1, int(startup_hits))
+    if state.pending_doa_hits < min_hits:
+        return
+
+    if now_ts - state.last_send_ts < min_send_period:
+        return
+
+    az_send = float(state.pending_doa_azimuth)
     if state.last_doa_azimuth is not None:
-        d = abs(_wrap_deg(az - float(state.last_doa_azimuth)))
+        d = abs(_wrap_deg(az_send - float(state.last_doa_azimuth)))
         if d < float(min_delta_deg):
             return
     _reset_attend_state(state)
-    x, y, z = _azimuth_to_xyz(az, float(distance_m), float(y_m))
+    x, y, z = _azimuth_to_xyz(az_send, float(distance_m), float(y_m))
     furhat.attend_location(x, y, z)
     state.last_send_ts = now_ts
-    state.last_doa_azimuth = az
+    state.last_doa_azimuth = az_send
+    state.pending_doa_azimuth = az_send
+    state.pending_doa_hits = min_hits
 
 
 def _print_text(payload: dict, top_k: int) -> None:
@@ -548,9 +692,19 @@ def _print_text(payload: dict, top_k: int) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.cnn_source == "furhat":
+        _ensure_no_proxy(args.furhat_ip)
+    if args.attend_furhat:
+        _ensure_no_proxy(args.attend_furhat_ip or args.furhat_ip)
     cfg = FusionConfig(
         min_sigma_deg=float(args.min_sigma_deg),
+        max_sigma_deg=float(args.max_sigma_deg),
         default_sigma_deg=float(args.default_sigma_deg),
+        sigma_trust_decay_deg=float(args.sigma_trust_decay_deg),
+        min_align_gap=float(args.min_align_gap),
+        doa_delta_hard_gate_deg=float(args.doa_delta_hard_gate_deg),
+        min_reliability_for_doa=float(args.min_doa_reliability_for_fusion),
+        reliability_gamma=float(args.doa_reliability_gamma),
         fixed_doa_weight=0.35,
     )
 
@@ -607,11 +761,17 @@ def main() -> None:
     min_send_period = 1.0 / max(float(args.send_hz), 1e-3)
     tick_period = 1.0 / max(float(args.tick_hz), 1e-3)
     speech_active_until = 0.0
+    start_ts = time.time()
     next_tick = time.time()
     last_quiet_log_ts = 0.0
 
     try:
         while True:
+            if args.max_runtime_sec is not None and (time.time() - start_ts) >= float(
+                args.max_runtime_sec
+            ):
+                print("[run-live-fusion] reached --max-runtime-sec, exiting.")
+                break
             if step6_proc.poll() is not None:
                 raise RuntimeError(
                     f"step6 process exited early with code {step6_proc.returncode}."
@@ -731,6 +891,11 @@ def main() -> None:
                         y_m=float(args.doa_target_y_m),
                         min_reliability=float(args.doa_attend_min_reliability),
                         min_delta_deg=float(args.doa_attend_min_delta_deg),
+                        startup_hits=int(args.doa_attend_startup_hits),
+                        consensus_deg=float(args.doa_attend_consensus_deg),
+                        front_only=bool(args.doa_attend_front_only),
+                        front_min_deg=float(args.doa_attend_front_min_deg),
+                        front_max_deg=float(args.doa_attend_front_max_deg),
                     )
                 else:
                     _reset_attend_state(attend_state)

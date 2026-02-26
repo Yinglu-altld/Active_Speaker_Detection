@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional
 
 import numpy as np
 import torch
@@ -61,8 +61,6 @@ class DOAObservation:
     audio_conf: float
     energy: float
     noise_energy: float
-    speech_gate_energy: float
-    update_gate_energy: float
     speech_detected: bool
     speech_active: bool
     speech_ended: bool
@@ -70,9 +68,6 @@ class DOAObservation:
     doa_conf: Optional[float]
     doa_conf_srp: Optional[float]
     doa_sigma_deg: Optional[float]
-    doa_entropy: Optional[float]
-    doa_conf_components: Optional[Dict[str, float]]
-    doa_peaks: Optional[List[Dict]]
     doa_updated: bool
 
     def to_dict(self) -> dict:
@@ -82,17 +77,12 @@ class DOAObservation:
             "conf_doa": self.doa_conf,
             "conf_doa_srp": self.doa_conf_srp,
             "sigma_deg": self.doa_sigma_deg,
-            "entropy": self.doa_entropy,
-            "conf_components": self.doa_conf_components,
-            "peaks": self.doa_peaks,
             "vad_prob": self.vad_prob,
             "speech_prob": self.speech_prob,
             "snr_db": self.snr_db,
             "audio_conf": self.audio_conf,
             "energy": self.energy,
             "noise_energy": self.noise_energy,
-            "speech_gate_energy": self.speech_gate_energy,
-            "update_gate_energy": self.update_gate_energy,
             "speech_detected": self.speech_detected,
             "speech_active": self.speech_active,
             "speech_ended": self.speech_ended,
@@ -162,12 +152,11 @@ class DOAEstimator:
         offset = float(self.cfg.azimuth_offset_deg)
         return self._wrap_deg(sign * float(azimuth_deg) + offset)
 
-    def _smooth_azimuth(self, measured_deg: float, conf: float, sigma_deg: Optional[float], entropy: Optional[float]) -> tuple[float, float, float]:
+    def _smooth_azimuth(self, measured_deg: float, conf: float, sigma_deg: Optional[float]) -> tuple[float, float, float]:
         # Quality-adaptive circular smoothing to suppress SRP jitter.
         measured_deg, _ = self._resolve_front_back_ambiguity(measured_deg)
         sigma_term = 1.0 if sigma_deg is None else float(np.exp(-max(0.0, float(sigma_deg) - 35.0) / 55.0))
-        entropy_term = 1.0 if entropy is None else float(np.exp(-max(0.0, float(entropy) - 0.993) / 0.006))
-        quality = float(max(0.0, min(1.0, float(conf) * sigma_term * entropy_term)))
+        quality = float(max(0.0, min(1.0, float(conf) * sigma_term)))
         a_min = float(max(0.0, min(1.0, self.cfg.doa_smooth_alpha_min)))
         a_max = float(max(a_min, min(1.0, self.cfg.doa_smooth_alpha_max)))
         alpha = a_min + (a_max - a_min) * quality
@@ -208,10 +197,6 @@ class DOAEstimator:
         audio_conf = 0.7 * vad_conf + 0.3 * snr_conf
 
         # VAD-only speech gating (energy thresholds are ignored for detection).
-        speech_gate_e = max(
-            float(self.cfg.energy_threshold),
-            float(self.noise_e) * float(self.cfg.snr_speech_ratio) + float(self.cfg.snr_speech_add),
-        )
         speech_detected = float(self.vad_sm) >= float(self.cfg.vad_threshold)
 
         prev_hold = self.hold
@@ -224,24 +209,12 @@ class DOAEstimator:
             self.last_valid_doa = None
             self.smooth_doa_deg = None
 
-        update_gate_e = max(
-            float(self.cfg.energy_update_threshold),
-            float(self.noise_e) * float(self.cfg.snr_update_ratio) + float(self.cfg.snr_update_add),
-        )
-        vad_update_thr = (
-            float(self.cfg.vad_threshold)
-            if self.cfg.vad_update_threshold is None
-            else float(self.cfg.vad_update_threshold)
-        )
         # Only update DOA on real speech frames; during hold we reuse last DOA.
 
         doa_deg = None
         doa_conf = None
         doa_conf_srp = None
         doa_sigma = None
-        doa_entropy = None
-        doa_conf_components = None
-        doa_peaks = None
         doa_updated = False
         if speech_detected:
             out = self.srp.estimate(mics_i16.astype(np.float32))
@@ -251,42 +224,17 @@ class DOAEstimator:
                 # Keep geometry confidence separate from audio reliability.
                 doa_conf = float(doa_conf_srp)
                 doa_sigma = out.sigma_deg
-                doa_entropy = float(out.entropy)
-                doa_deg_raw_smooth, smooth_quality, smooth_alpha = self._smooth_azimuth(
+                doa_deg_raw_smooth, _, _ = self._smooth_azimuth(
                     measured_deg=doa_deg,
                     conf=doa_conf_srp,
                     sigma_deg=doa_sigma,
-                    entropy=doa_entropy,
                 )
                 doa_deg = self._map_azimuth(doa_deg_raw_smooth)
-                doa_conf_components = dict(out.conf_components)
-                doa_conf_components["geom_conf"] = float(doa_conf_srp)
-                doa_conf_components["audio_conf"] = float(audio_conf)
-                doa_conf_components["vad_conf"] = float(vad_conf)
-                doa_conf_components["snr_conf"] = float(snr_conf)
-                doa_conf_components["smooth_quality"] = float(smooth_quality)
-                doa_conf_components["smooth_alpha"] = float(smooth_alpha)
-                doa_conf_components["raw_azimuth_deg"] = float(out.doa_deg)
-                doa_conf_components["smoothed_raw_azimuth_deg"] = float(doa_deg_raw_smooth)
-                doa_conf_components["mapped_azimuth_deg"] = float(doa_deg)
-                doa_conf_components["azimuth_sign"] = float(-1.0 if int(self.cfg.azimuth_sign) < 0 else 1.0)
-                doa_conf_components["azimuth_offset_deg"] = float(self.cfg.azimuth_offset_deg)
-                doa_peaks = []
-                for peak in out.peaks:
-                    p = dict(peak)
-                    try:
-                        p["azimuth_deg"] = self._map_azimuth(float(p["azimuth_deg"]))
-                    except (TypeError, ValueError):
-                        pass
-                    doa_peaks.append(p)
                 self.last_valid_doa = {
                     "azimuth_deg": doa_deg,
                     "conf_doa": doa_conf,
                     "conf_doa_srp": doa_conf_srp,
                     "sigma_deg": doa_sigma,
-                    "entropy": doa_entropy,
-                    "conf_components": dict(doa_conf_components),
-                    "peaks": doa_peaks,
                 }
                 doa_updated = True
         elif speech_active and self.last_valid_doa is not None:
@@ -295,13 +243,6 @@ class DOAEstimator:
             doa_conf = float(held["conf_doa"])
             doa_conf_srp = float(held["conf_doa_srp"])
             doa_sigma = held["sigma_deg"]
-            doa_entropy = held["entropy"]
-            doa_conf_components = dict(held["conf_components"])
-            doa_conf_components["held"] = 1.0
-            doa_conf_components["audio_conf"] = float(audio_conf)
-            doa_conf_components["vad_conf"] = float(vad_conf)
-            doa_conf_components["snr_conf"] = float(snr_conf)
-            doa_peaks = held["peaks"]
 
         if not speech_active and float(self.vad_sm) < 0.15:
             na = float(self.cfg.noise_alpha)
@@ -315,8 +256,6 @@ class DOAEstimator:
             audio_conf=float(audio_conf),
             energy=energy,
             noise_energy=float(self.noise_e),
-            speech_gate_energy=float(speech_gate_e),
-            update_gate_energy=float(update_gate_e),
             speech_detected=speech_detected,
             speech_active=speech_active,
             speech_ended=speech_ended,
@@ -324,9 +263,6 @@ class DOAEstimator:
             doa_conf=doa_conf,
             doa_conf_srp=doa_conf_srp,
             doa_sigma_deg=doa_sigma,
-            doa_entropy=doa_entropy,
-            doa_conf_components=doa_conf_components,
-            doa_peaks=doa_peaks,
             doa_updated=doa_updated,
         )
 

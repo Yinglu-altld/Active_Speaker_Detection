@@ -89,30 +89,12 @@ Each frame is one JSON line:
   "conf_doa": 0.61,
   "conf_doa_srp": 0.84,
   "sigma_deg": 11.4,
-  "entropy": 0.33,
-  "conf_components": {
-    "peak_ratio_score": 0.79,
-    "contrast_score": 0.67,
-    "entropy_score": 0.67,
-    "sigma_score": 0.63,
-    "sharpness_score": 0.54,
-    "peak_ratio_raw": 2.58,
-    "audio_conf": 0.73,
-    "vad_conf": 0.81,
-    "snr_conf": 0.55
-  },
-  "peaks": [
-    {"azimuth_deg": 118.0, "score": 53.0, "score_norm": 1.0, "score_prob": 0.20},
-    {"azimuth_deg": 116.0, "score": 49.1, "score_norm": 0.93, "score_prob": 0.18}
-  ],
   "vad_prob": 0.78,
   "speech_prob": 0.72,
   "snr_db": 11.6,
   "audio_conf": 0.73,
   "energy": 211.0,
   "noise_energy": 95.0,
-  "speech_gate_energy": 206.0,
-  "update_gate_energy": 269.0,
   "speech_detected": true,
   "speech_active": true,
   "speech_ended": false,
@@ -127,7 +109,7 @@ conf_doa = conf_doa_srp
 ```
 
 Where:
-- `conf_doa_srp` comes from SRP-PHAT peak quality (peak ratio, contrast, entropy, sigma).
+- `conf_doa_srp` comes from SRP-PHAT peak quality (peak ratio, contrast, sigma).
 - `audio_conf` remains a separate reliability signal from VAD + SNR.
 - Fusion combines reliability as `0.6 * conf_doa_srp + 0.4 * audio_conf`.
 

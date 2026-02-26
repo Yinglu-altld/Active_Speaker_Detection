@@ -246,6 +246,11 @@ def main():
         snr_update_add=a.snr_update_add,
         speech_hold_ms=a.speech_hold_ms,
         doa_quality_threshold=a.doa_quality_threshold,
+        doa_smooth_alpha_min=0.08,
+        doa_smooth_alpha_max=0.35,
+        doa_smooth_max_step_deg=20.0,
+        azimuth_sign=1,
+        azimuth_offset_deg=0.0,
     )
     doa_est = DOAEstimator(doa_cfg, srp, SileroGate(a.vad_threshold, a.fs))
     sm_az = None
@@ -307,7 +312,7 @@ def main():
                     last_doa_match_ts = 0.0
                 if not obs.speech_active:
                     if now - last_idle_log >= 1.0:
-                        print(f"[idle] vad={float(obs.speech_prob):4.2f} e={obs.energy:6.1f} noise={float(obs.noise_energy):6.1f} gate={obs.speech_gate_energy:6.1f}")
+                        print(f"[idle] vad={float(obs.speech_prob):4.2f} e={obs.energy:6.1f} noise={float(obs.noise_energy):6.1f}")
                         last_idle_log = now
                     continue
 

@@ -39,6 +39,18 @@ except Exception:
     score_users_for_frame = None
 
 
+def _ensure_no_proxy(host: str | None) -> None:
+    if not host:
+        return
+    existing = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    entries = [item.strip() for item in existing.split(",") if item.strip()]
+    if host not in entries:
+        entries.append(str(host))
+    value = ",".join(entries) if entries else str(host)
+    os.environ["NO_PROXY"] = value
+    os.environ["no_proxy"] = value
+
+
 @dataclass
 class ModelSpec:
     model_path: Path
@@ -215,7 +227,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fusion-default-sigma-deg", type=float, default=25.0)
     parser.add_argument("--fusion-min-sigma-deg", type=float, default=8.0)
+    parser.add_argument("--fusion-min-doa-reliability", type=float, default=0.05)
+    parser.add_argument("--fusion-doa-reliability-gamma", type=float, default=0.65)
+    parser.add_argument(
+        "--overlay-gate-speak-by-audio",
+        action="store_true",
+        default=True,
+        help="In fusion overlay mode, force displayed speak=0 when DOA is missing or audio says no speech.",
+    )
+    parser.add_argument(
+        "--no-overlay-gate-speak-by-audio",
+        action="store_false",
+        dest="overlay_gate_speak_by_audio",
+        help="Disable audio gating of displayed speak flag in fusion overlay mode.",
+    )
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--max-runtime-sec",
+        type=float,
+        default=None,
+        help="Optional wall-clock limit for smoke tests (seconds).",
+    )
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--window-width", type=int, default=960)
     parser.add_argument("--window-height", type=int, default=540)
@@ -597,9 +629,11 @@ def estimate_user_bearing_deg(
     frame_width: int,
     hfov_deg: float,
 ) -> float | None:
-    bearing = location_to_bearing_deg(user.location_x, user.location_z)
+    # Prefer camera-image geometry for fusion bearing; it is usually more
+    # left/right symmetric than robot-world user location estimates.
+    bearing = bbox_to_bearing_deg(bbox, frame_width, hfov_deg)
     if bearing is None:
-        bearing = bbox_to_bearing_deg(bbox, frame_width, hfov_deg)
+        bearing = location_to_bearing_deg(user.location_x, user.location_z)
     if bearing is None:
         return None
     return float(bearing)
@@ -695,11 +729,16 @@ class FusionOverlayRuntime:
         self.cfg = FusionConfig(
             min_sigma_deg=float(args.fusion_min_sigma_deg),
             default_sigma_deg=float(args.fusion_default_sigma_deg),
+            min_reliability_for_doa=float(args.fusion_min_doa_reliability),
+            reliability_gamma=float(args.fusion_doa_reliability_gamma),
             fixed_doa_weight=0.35,
         )
+        self.overlay_gate_speak_by_audio = bool(args.overlay_gate_speak_by_audio)
 
     def annotate_outputs(self, outputs: list[dict], t_value: float) -> dict:
         doa_obs = self.live_doa.get_for_time(t_value=t_value, max_staleness_sec=self.max_staleness_sec)
+        for out in outputs:
+            out["visual_speak"] = bool(out.get("speak", False))
         hud = {
             "mode": "DOA_MISSING" if doa_obs is None else "SPEECH_AV",
             "speech_active": False if doa_obs is None else bool(doa_obs.get("speech_active") or doa_obs.get("speech_detected")),
@@ -723,6 +762,8 @@ class FusionOverlayRuntime:
                 out["fusion_doa"] = 0.0
                 out["active_speaker"] = False
                 out["no_speech"] = False
+                if self.overlay_gate_speak_by_audio:
+                    out["speak"] = False
             return hud
 
         speech_active = bool(doa_obs.get("speech_active") or doa_obs.get("speech_detected"))
@@ -734,6 +775,8 @@ class FusionOverlayRuntime:
                 out["fusion_doa"] = 0.0
                 out["active_speaker"] = False
                 out["no_speech"] = True
+                if self.overlay_gate_speak_by_audio:
+                    out["speak"] = False
             return hud
 
         users = []
@@ -1045,6 +1088,7 @@ async def run_furhat_stream(
 
     if not args.furhat_ip:
         raise ValueError("--furhat-ip is required when --source=furhat")
+    _ensure_no_proxy(args.furhat_ip)
 
     frame_queue: deque[np.ndarray] = deque(maxlen=1)
     latest_users: list[UserBox] = []
@@ -1117,8 +1161,13 @@ async def run_furhat_stream(
 
     states: dict[str, TrackState] = {}
     print_state = {"last_print": 0}
+    start_ts = time.time()
     try:
         while True:
+            if args.max_runtime_sec is not None and (time.time() - start_ts) >= float(
+                args.max_runtime_sec
+            ):
+                break
             if not frame_queue:
                 await asyncio.sleep(0.01)
                 continue
@@ -1223,6 +1272,7 @@ def main() -> None:
                     )
                 )
             else:
+                start_ts = time.time()
                 if args.source == "file":
                     if not args.video_file:
                         raise ValueError("--video-file is required when --source=file")
@@ -1238,6 +1288,10 @@ def main() -> None:
                 states: dict[str, TrackState] = {}
                 print_state = {"last_print": 0}
                 while True:
+                    if args.max_runtime_sec is not None and (time.time() - start_ts) >= float(
+                        args.max_runtime_sec
+                    ):
+                        break
                     frame = cap.read()
                     if frame is None:
                         break
@@ -1262,6 +1316,11 @@ def main() -> None:
     finally:
         if cnn_jsonl_handle is not None:
             cnn_jsonl_handle.close()
+        if args.show:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
 
     if args.show:
         cv2.destroyAllWindows()
