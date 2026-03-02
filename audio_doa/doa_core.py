@@ -16,6 +16,10 @@ except ImportError:
 DOA_AZ_OFFSET_DEG = -90.0
 VAD_THRESHOLD_DB = 4.0
 APPLY_VAD_THRESHOLD_ON_START = True
+# Debounce/hold for converting raw VAD into stable speech activity.
+VAD_ON_HOLD_FRAMES = 3
+VAD_OFF_HOLD_FRAMES = 3
+MIN_SPEECH_ON_MS = 180.0
 
 
 def _wrap_deg(angle_deg: float) -> float:
@@ -90,6 +94,10 @@ def main() -> None:
 
     last_raw_az: Optional[float] = None
     prev_speech_active = False
+    speech_active_state = False
+    voice_on_run = 0
+    voice_off_run = 0
+    voice_run_start_ts: Optional[float] = None
     emitted = 0
     next_tick = time.time()
     try:
@@ -119,8 +127,37 @@ def main() -> None:
             if voice:
                 last_raw_az = raw_az
 
-            speech_detected = voice
-            speech_active = speech_detected
+            if voice:
+                voice_off_run = 0
+                voice_on_run += 1
+                if voice_run_start_ts is None:
+                    voice_run_start_ts = now
+            else:
+                voice_on_run = 0
+                voice_run_start_ts = None
+                voice_off_run += 1
+
+            if not speech_active_state:
+                sustained_ms = (
+                    0.0
+                    if voice_run_start_ts is None
+                    else (now - voice_run_start_ts) * 1000.0
+                )
+                if (
+                    voice
+                    and voice_on_run >= int(VAD_ON_HOLD_FRAMES)
+                    and sustained_ms >= float(MIN_SPEECH_ON_MS)
+                ):
+                    speech_active_state = True
+                    voice_off_run = 0
+            else:
+                if voice_off_run >= int(VAD_OFF_HOLD_FRAMES):
+                    speech_active_state = False
+                    voice_off_run = 0
+
+            speech_active = bool(speech_active_state)
+            # Keep detected consistent with active to avoid transient tap spikes.
+            speech_detected = speech_active
             speech_ended = prev_speech_active and (not speech_active)
 
             doa_updated = speech_detected and last_raw_az is not None

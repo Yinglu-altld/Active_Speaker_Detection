@@ -157,19 +157,22 @@ class ScoreHistory:
             cnn_score = out.get("fusion_cnn")
             if cnn_score is None:
                 cnn_score = out.get("prob")
+            doa_raw = out.get("fusion_doa_raw")
+            if doa_raw is None:
+                doa_raw = out.get("fusion_doa")
             frame_values[track_id] = (
                 self._to_value(cnn_score, clip_01=True),
-                self._to_value(out.get("fusion_doa"), clip_01=self.clip_doa_01),
+                self._to_value(doa_raw, clip_01=self.clip_doa_01),
                 self._to_value(out.get("fusion_overall"), clip_01=True),
             )
 
         for track_id, series in self._series.items():
-            cnn_score, doa_score, overall_score = frame_values.get(
+            cnn_score, doa_raw, overall_score = frame_values.get(
                 track_id,
                 (float("nan"), float("nan"), float("nan")),
             )
             series["cnn"].append(cnn_score)
-            series["doa"].append(doa_score)
+            series["doa"].append(doa_raw)
             series["overall"].append(overall_score)
 
     def get(self, track_id: str) -> dict[str, deque] | None:
@@ -542,6 +545,32 @@ def _draw_status_hud(frame, hud: dict | None) -> None:
         scale,
         state_color,
         thickness,
+        lineType=cv2.LINE_AA,
+    )
+
+    active_id = None if hud is None else hud.get("speaker_id")
+    active_txt = "-" if active_id in (None, "") else str(active_id)
+    active_text = f"ACTIVE: {active_txt}"
+    active_scale = 0.55
+    active_thickness = 2
+    (a_w, a_h), a_base = cv2.getTextSize(
+        active_text, font, active_scale, active_thickness
+    )
+    ax1 = max(8, int((frame.shape[1] - (a_w + 2 * pad_x)) / 2))
+    ay1 = y2 + 6
+    ax2 = min(frame.shape[1] - 8, ax1 + a_w + 2 * pad_x)
+    ay2 = ay1 + a_h + 2 * pad_y + a_base - 6
+    cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (20, 20, 20), -1)
+    atx = ax1 + pad_x
+    aty = ay2 - pad_y - a_base + 2
+    cv2.putText(
+        frame,
+        active_text,
+        (atx, aty),
+        font,
+        active_scale,
+        (220, 220, 220),
+        active_thickness,
         lineType=cv2.LINE_AA,
     )
 
@@ -946,6 +975,7 @@ def draw_overlays(
     _draw_status_hud(frame, hud)
     no_speech_mode = bool(hud and str(hud.get("mode", "")) == "NO_SPEECH")
     for out in outputs:
+        track_id = str(out.get("track_id", "-"))
         bbox = out.get("bbox")
         score_cnn = out.get("fusion_cnn")
         score_doa = out.get("fusion_doa")
@@ -964,12 +994,12 @@ def draw_overlays(
             x1, y1, x2, y2 = bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             if no_speech_mode:
-                label = "cnn:- doa:- o:-"
+                label = f"id:{track_id} cnn:- doa:- o:-"
             else:
                 cnn_txt = "-" if score_cnn is None else f"{float(score_cnn):.2f}"
                 doa_txt = "-" if score_doa is None else f"{float(score_doa):.2f}"
                 over_txt = "-" if overall is None else f"{float(overall):.2f}"
-                label = f"cnn:{cnn_txt} doa:{doa_txt} o:{over_txt}"
+                label = f"id:{track_id} cnn:{cnn_txt} doa:{doa_txt} o:{over_txt}"
             text_x = x1
             text_y = max(18, y1 - 6)
             cv2.putText(
@@ -1442,7 +1472,7 @@ def process_frame(
 
     # Dashboard semantics:
     # - CNN: ungated model probability
-    # - DOA: ungated geometric alignment
+    # - DOA: ungated geometric alignment (raw DOA)
     # - Overall: gated fusion score
     chart_outputs: list[dict] = []
     overall_inactive = True
@@ -1455,17 +1485,18 @@ def process_frame(
             overall_inactive = False
         elif args.overall_missing_style in ("zero", "gray"):
             overall_value = 0.0
+        doa_raw_score = _raw_doa_alignment_score(
+            azimuth_deg=None if doa_azimuth_raw is None else float(doa_azimuth_raw),
+            bearing_deg=None if out.get("bearing_deg") is None else float(out.get("bearing_deg")),
+            sigma_deg=None if doa_sigma is None else float(doa_sigma),
+            min_sigma_deg=float(args.fusion_min_sigma_deg),
+            default_sigma_deg=float(args.fusion_default_sigma_deg),
+        )
         chart_outputs.append(
             {
                 "track_id": track_id,
                 "fusion_cnn": out.get("prob"),
-                "fusion_doa": _raw_doa_alignment_score(
-                    azimuth_deg=None if doa_azimuth_raw is None else float(doa_azimuth_raw),
-                    bearing_deg=None if out.get("bearing_deg") is None else float(out.get("bearing_deg")),
-                    sigma_deg=None if doa_sigma is None else float(doa_sigma),
-                    min_sigma_deg=float(args.fusion_min_sigma_deg),
-                    default_sigma_deg=float(args.fusion_default_sigma_deg),
-                ),
+                "fusion_doa": doa_raw_score,
                 "fusion_overall": overall_value,
             }
         )
