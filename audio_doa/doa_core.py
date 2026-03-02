@@ -26,7 +26,9 @@ def _wrap_deg(angle_deg: float) -> float:
 class DOAObservation:
     t: float
     raw_azimuth_deg: Optional[float]
+    raw_azimuth_plot_deg: Optional[float]
     azimuth_deg: Optional[float]
+    azimuth_plot_deg: Optional[float]
     vad_prob: float
     speech_detected: bool
     speech_active: bool
@@ -41,7 +43,9 @@ class DOAObservation:
         return {
             "t": float(self.t),
             "raw_azimuth_deg": self.raw_azimuth_deg,
+            "raw_azimuth_plot_deg": self.raw_azimuth_plot_deg,
             "azimuth_deg": self.azimuth_deg,
+            "azimuth_plot_deg": self.azimuth_plot_deg,
             "conf_doa": float(self.conf_doa),
             "conf_doa_srp": float(self.conf_doa_srp),
             "sigma_deg": self.sigma_deg,
@@ -125,6 +129,7 @@ def main() -> None:
             azimuth_deg = None
             if speech_active and last_raw_az is not None:
                 azimuth_deg = float(_wrap_deg(float(last_raw_az) + float(DOA_AZ_OFFSET_DEG)))
+            azimuth_plot_deg = float(_wrap_deg(float(raw_az) + float(DOA_AZ_OFFSET_DEG)))
 
             vad_prob = 1.0 if speech_detected else 0.0
             audio_conf = 1.0 if speech_active else 0.0
@@ -134,7 +139,9 @@ def main() -> None:
             obs = DOAObservation(
                 t=now,
                 raw_azimuth_deg=None if last_raw_az is None else float(last_raw_az),
+                raw_azimuth_plot_deg=float(raw_az),
                 azimuth_deg=azimuth_deg,
+                azimuth_plot_deg=azimuth_plot_deg,
                 vad_prob=vad_prob,
                 speech_detected=speech_detected,
                 speech_active=speech_active,

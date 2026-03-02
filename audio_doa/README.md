@@ -1,12 +1,17 @@
-# Audio DOA (ReSpeaker USB) + Live Fusion
+# Audio + Fusion Module (ReSpeaker USB)
 
-This folder contains the audio/fusion side of the realtime system.
+This folder contains realtime DOA ingest, fusion scoring, Furhat attend control, and optional button-based ground truth.
 
-- `doa_core.py`: reads ReSpeaker built-in `direction` + `is_voice()` over USB and emits JSONL
-- `respeaker_tuning.py`: low-level USB parameter read/write wrapper
-- `run_live_fusion.py`: starts visual realtime + doa_core + fusion + Furhat attend control
-- `fusion.py`: scoring logic
-- `fusion_stub.py`: isolated fusion debugging
+## Files
+
+- `doa_core.py`: reads ReSpeaker `direction` and `is_voice()` over USB and emits JSON observations.
+- `respeaker_tuning.py`: low-level USB register wrapper.
+- `fusion.py`: per-user `cnn/doa/overall` scoring.
+- `run_live_fusion.py`: launcher for step6 + DOA + fusion + Furhat + optional GT bridge.
+- `button_gt_bridge.py`: receives UDP button packets (`u0`, `u1`) and emits GT JSONL.
+- `fusion_stub.py`: quick scoring debug without full UI.
+
+---
 
 ## Install
 
@@ -19,27 +24,50 @@ USB dependency:
 - macOS: `brew install libusb`
 - Linux: install `libusb-1.0` and set USB permissions
 
-## DOA Core Commands
+---
 
-Basic:
+## DOA observation fields
+
+`doa_core.py` now emits both gated and ungated angle fields:
+
+- `raw_azimuth_deg`: last speech-valid raw angle (legacy/gated behavior source).
+- `azimuth_deg`: gated + offset angle used by fusion decisions.
+- `raw_azimuth_plot_deg`: current raw hardware angle each poll (ungated).
+- `azimuth_plot_deg`: current raw angle after offset each poll (ungated, for plotting).
+
+This allows UI DOA plots/compass to stay ungated while keeping fusion logic unchanged.
+
+---
+
+## Angle convention
+
+Hardware DOA is in `[0, 360)`. Project conversion:
+
+```text
+azimuth = wrap(raw_azimuth - 90)
+```
+
+Interpretation:
+
+- `0°`: front (`+Z`)
+- positive: user-right (`+X`)
+- negative: user-left (`-X`)
+
+---
+
+## DOA core commands
 
 ```bash
 ./venv/bin/python audio_doa/doa_core.py
 ```
 
-Speech-only output:
+Continuous output (recommended for ungated plotting):
 
 ```bash
-./venv/bin/python audio_doa/doa_core.py --no-emit-idle
+./venv/bin/python audio_doa/doa_core.py --emit-idle --poll-hz 20
 ```
 
-Custom USB IDs:
-
-```bash
-./venv/bin/python audio_doa/doa_core.py --usb-vendor-id 0x2886 --usb-product-id 0x0018
-```
-
-Valid CLI flags in current version:
+Valid flags:
 
 - `--usb-vendor-id`
 - `--usb-product-id`
@@ -47,48 +75,68 @@ Valid CLI flags in current version:
 - `--emit-idle` / `--no-emit-idle`
 - `--max-frames`
 
-## Angle Convention
+---
 
-ReSpeaker hardware reports `raw_azimuth_deg` in `[0, 360)`.
+## VAD threshold tuning
 
-Current conversion in `doa_core.py`:
+Configured in code (`doa_core.py`):
 
-- `azimuth_deg = wrap(raw_azimuth_deg - 90)`
-- `0°` = front (`+Z`)
-- `+` = user-right (`+X`)
-- `-` = user-left (`-X`)
+- `VAD_THRESHOLD_DB`
+- `APPLY_VAD_THRESHOLD_ON_START`
 
-This assumes board placement where hardware `90°` points to front/users.
+If writing threshold causes USB instability on your machine, disable write-on-start:
 
-## VAD Tuning
+```python
+APPLY_VAD_THRESHOLD_ON_START = False
+```
 
-Current VAD threshold is configured in code, not CLI:
+---
 
-- `audio_doa/doa_core.py` -> `VAD_THRESHOLD_DB`
+## Run full live fusion
 
-Related settings:
-
-- `APPLY_VAD_THRESHOLD_ON_START`: whether to write threshold at startup
-- If USB write causes instability on your machine, set it to `False`
-
-## Run Live Fusion
+### With button ground-truth
 
 ```bash
 ./venv/bin/python audio_doa/run_live_fusion.py \
   --furhat-ip 192.168.1.109 \
   --show-child-logs \
-  --step6-extra "--show --window-width 960 --window-height 540" \
-  --doa-extra "--emit-idle --poll-hz 20"
+  --use-button-gt \
+  --gt-listen-port 5005 \
+  --gt-user0-id user-0 --gt-user1-id user-1 \
+  --gt-button0-key u0 --gt-button1-key u1 \
+  --doa-extra="--emit-idle --poll-hz 20" \
+  --step6-extra="--show --window-width 960 --window-height 540"
 ```
 
-This opens:
+### Without button ground-truth
 
-- `vvad_realtime` (camera + bbox)
-- `vvad_scores` (separate score plots)
+```bash
+./venv/bin/python audio_doa/run_live_fusion.py \
+  --furhat-ip 192.168.1.109 \
+  --show-child-logs \
+  --doa-extra="--emit-idle --poll-hz 20" \
+  --step6-extra="--show --window-width 960 --window-height 540"
+```
 
-## Common Mistake After Migration
+---
 
-These old flags are no longer supported by `doa_core.py` and will crash startup:
+## NodeMCU GT payload format
+
+Send UDP JSON to the configured host/port:
+
+```json
+{"u0":1,"u1":0}
+```
+
+- `u0`: button 0 pressed state
+- `u1`: button 1 pressed state
+- pressed=`1`, released=`0`
+
+---
+
+## Invalid legacy flags (do not use)
+
+These were from the old audio-stream branch and are no longer supported in `doa_core.py`:
 
 - `--audio-device`
 - `--audio-channels`
@@ -96,7 +144,9 @@ These old flags are no longer supported by `doa_core.py` and will crash startup:
 - `--vad-threshold`
 - `--speech-hold-ms`
 
-## Fusion Isolation Test
+---
+
+## Fusion-only quick check
 
 ```bash
 ./venv/bin/python audio_doa/doa_core.py --no-emit-idle \

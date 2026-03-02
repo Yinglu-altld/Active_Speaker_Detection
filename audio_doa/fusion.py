@@ -131,6 +131,9 @@ def score_users_for_frame(
         "weights": {"cnn": float(w_cnn), "doa": float(w_doa)},
         "doa": {
             "azimuth_deg": azimuth_deg,
+            "azimuth_plot_deg": doa_obs.get("azimuth_plot_deg"),
+            "raw_azimuth_deg": doa_obs.get("raw_azimuth_deg"),
+            "raw_azimuth_plot_deg": doa_obs.get("raw_azimuth_plot_deg"),
             "conf_doa": conf_doa,
             "conf_doa_srp": conf_doa_srp,
             "audio_conf": audio_conf,

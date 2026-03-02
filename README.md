@@ -1,12 +1,27 @@
-# Active Speaker Detection (CNN + MediaPipe + ReSpeaker DOA + Fusion)
+# Active Speaker Detection for Furhat
 
-This project performs realtime active speaker detection for Furhat.
+Realtime active-speaker system built from:
 
-- Visual branch: CNN on temporal face landmarks (`scripts/step6_realtime_infer.py`)
-- Audio branch: ReSpeaker built-in DOA + VAD over USB (`audio_doa/doa_core.py`)
-- Fusion branch: per-user overall score + Furhat head control (`audio_doa/run_live_fusion.py`)
+- **Visual branch**: MediaPipe face landmarks + temporal CNN (`scripts/step6_realtime_infer.py`)
+- **Audio branch**: ReSpeaker USB built-in DOA + built-in VAD (`audio_doa/doa_core.py`)
+- **Fusion/control branch**: user scoring + Furhat attend control (`audio_doa/run_live_fusion.py`)
+- **Optional ground-truth branch**: NodeMCU button stream for reality plot (`audio_doa/button_gt_bridge.py`)
 
-## 1. Quick Setup
+---
+
+## 1) What changed in this version
+
+- ReSpeaker-based pipeline (no SRP-PHAT runtime path in live fusion).
+- Added optional UDP button GT integration (`u0`, `u1`) for a per-user **Reality** plot.
+- Added separate DOA compass panel showing **ungated + offset azimuth** (`azimuth_plot_deg`).
+- UI score behavior:
+  - `CNN` plot: ungated raw CNN probability.
+  - `DOA` plot: ungated DOA-alignment score.
+  - `Overall` plot: unchanged fusion output (gated by runtime state logic).
+
+---
+
+## 2) Setup
 
 ```bash
 git clone https://github.com/Yinglu-altld/Active_Speaker_Detection.git
@@ -17,14 +32,12 @@ source venv/bin/activate
 ./venv/bin/pip install -r audio_doa/requirements.txt
 ```
 
-USB dependency for ReSpeaker:
+ReSpeaker USB dependency:
 
 - macOS: `brew install libusb`
-- Linux: install `libusb-1.0` package and ensure USB permissions
+- Linux: install `libusb-1.0` and ensure device permissions
 
-## 2. Runtime Files
-
-Current realtime inference expects:
+Required model/runtime files:
 
 - `data/models/cnn_vvad/best.pt`
 - `data/models/cnn_vvad/config.json`
@@ -32,32 +45,86 @@ Current realtime inference expects:
 - `data/windows/windows_info.json`
 - `data/models/face_landmarker_v2.task`
 
-## 3. Run Full Live Fusion (Recommended)
+---
+
+## 3) Coordinate convention
+
+ReSpeaker hardware gives `raw_azimuth_deg` in `[0, 360)`.
+
+Current project conversion:
+
+```text
+azimuth_deg = wrap(raw_azimuth_deg - 90)
+```
+
+With this mounting:
+
+- `azimuth_deg = 0` → front (`+Z`)
+- `azimuth_deg > 0` → user-right (`+X`)
+- `azimuth_deg < 0` → user-left (`-X`)
+
+`azimuth_plot_deg` is the same conversion but published continuously for plotting (ungated).
+
+---
+
+## 4) Run full system (recommended)
+
+### A) With NodeMCU button GT (Reality plot)
 
 ```bash
 ./venv/bin/python audio_doa/run_live_fusion.py \
   --furhat-ip 192.168.1.109 \
   --show-child-logs \
-  --step6-extra "--show --window-width 960 --window-height 540" \
-  --doa-extra "--emit-idle --poll-hz 20"
+  --use-button-gt \
+  --gt-listen-port 5005 \
+  --gt-user0-id user-0 --gt-user1-id user-1 \
+  --gt-button0-key u0 --gt-button1-key u1 \
+  --doa-extra="--emit-idle --poll-hz 20" \
+  --step6-extra="--show --window-width 960 --window-height 540"
 ```
 
-What this starts internally:
+### B) Without button GT
 
-- `scripts/step6_realtime_infer.py`
-- `audio_doa/doa_core.py`
-- Fusion + Furhat attend control
+```bash
+./venv/bin/python audio_doa/run_live_fusion.py \
+  --furhat-ip 192.168.1.109 \
+  --show-child-logs \
+  --doa-extra="--emit-idle --poll-hz 20" \
+  --step6-extra="--show --window-width 960 --window-height 540"
+```
 
-UI windows:
+---
 
-- `vvad_realtime`: camera + bbox + state
-- `vvad_scores`: separate 3-panel plots (`CNN`, `DOA`, `Overall`) in range `[0, 1]`
+## 5) NodeMCU button payload (for GT)
 
-## 4. Important Flag Notes (Current Version)
+Send UDP JSON to host/port configured in `run_live_fusion.py` (default `5005`):
 
-`audio_doa/doa_core.py` now uses ReSpeaker USB control, so old audio-stream flags are not valid anymore.
+```json
+{"u0":1,"u1":0}
+```
 
-Invalid old flags (do not use in `--doa-extra`):
+- `u0` usually maps to D2 button, `u1` to D6 button.
+- `1` = pressed, `0` = released.
+
+---
+
+## 6) UI windows
+
+- `vvad_realtime`: camera, bbox, state text, per-bbox user id and scores.
+- `vvad_scores`:
+  - top state text + DOA compass (`Ungated+Offset` azimuth),
+  - `CNN / DOA / Overall / Reality` per-user time series.
+
+Notes:
+
+- User colors are shared across all plot panels.
+- Furhat user IDs are remapped to stable aliases (`user-0`, `user-1`, ...), so plots and bbox labels match.
+
+---
+
+## 7) Important flags and migration note
+
+`audio_doa/doa_core.py` is USB-control based. Old audio-stream flags are invalid and will fail:
 
 - `--audio-device`
 - `--audio-channels`
@@ -65,27 +132,32 @@ Invalid old flags (do not use in `--doa-extra`):
 - `--vad-threshold`
 - `--speech-hold-ms`
 
-Valid `doa_core.py` flags:
+Use `--doa-extra` only with valid DOA-core flags, e.g.:
 
+- `--emit-idle` / `--no-emit-idle`
+- `--poll-hz`
 - `--usb-vendor-id`
 - `--usb-product-id`
-- `--poll-hz`
-- `--emit-idle` / `--no-emit-idle`
-- `--max-frames`
 
-## 5. VAD / Angle Tuning (Code-Level)
+---
 
-Tune in `audio_doa/doa_core.py`:
+## 8) Tuning points (code-level)
 
-- `VAD_THRESHOLD_DB`: ReSpeaker built-in VAD threshold (dB)
-- `DOA_AZ_OFFSET_DEG`: angle offset (`-90` means hardware `90°` maps to front)
-- `APPLY_VAD_THRESHOLD_ON_START`: whether to write threshold to device on startup
+In `audio_doa/doa_core.py`:
 
-If your USB stack is unstable when writing VAD threshold, set `APPLY_VAD_THRESHOLD_ON_START = False`.
+- `DOA_AZ_OFFSET_DEG`
+- `VAD_THRESHOLD_DB`
+- `APPLY_VAD_THRESHOLD_ON_START`
 
-## 6. Visual-Only Realtime
+If USB becomes unstable when writing VAD threshold, set:
 
-Furhat camera:
+```python
+APPLY_VAD_THRESHOLD_ON_START = False
+```
+
+---
+
+## 9) Visual-only run (no fusion)
 
 ```bash
 ./venv/bin/python scripts/step6_realtime_infer.py \
@@ -95,20 +167,10 @@ Furhat camera:
   --window-width 960 --window-height 540
 ```
 
-Local webcam:
+---
 
-```bash
-./venv/bin/python scripts/step6_realtime_infer.py --source opencv --video-device 0 --show
-```
+## 10) Audio docs
 
-## 7. Optional Training Pipeline
+For audio-only commands and lower-level details, see:
 
-```bash
-./venv/bin/python scripts/step3_batch_extract_landmarks.py --min-rows 50
-./venv/bin/python scripts/step4_build_windows.py --window-sec 1.5 --hop-sec 0.5 --target-fps 25
-./venv/bin/python scripts/step5_train_cnn.py --val-video WwoTG3_OjUg --epochs 40 --batch-size 128
-```
-
-## 8. More Audio Details
-
-See `audio_doa/README.md` for DOA-only and audio/fusion debugging commands.
+- `audio_doa/README.md`

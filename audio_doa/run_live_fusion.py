@@ -179,6 +179,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python-exe", default=sys.executable)
     parser.add_argument("--cnn-jsonl-live", default="/tmp/cnn_live.jsonl")
     parser.add_argument("--doa-jsonl-live", default="/tmp/doa_live.jsonl")
+    parser.add_argument("--gt-jsonl-live", default="/tmp/gt_live.jsonl")
     parser.add_argument("--truncate-cnn-jsonl", action="store_true", default=True)
     parser.add_argument(
         "--no-truncate-cnn-jsonl", action="store_false", dest="truncate_cnn_jsonl"
@@ -186,6 +187,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--truncate-doa-jsonl", action="store_true", default=True)
     parser.add_argument(
         "--no-truncate-doa-jsonl", action="store_false", dest="truncate_doa_jsonl"
+    )
+    parser.add_argument("--truncate-gt-jsonl", action="store_true", default=True)
+    parser.add_argument(
+        "--no-truncate-gt-jsonl", action="store_false", dest="truncate_gt_jsonl"
     )
 
     parser.add_argument(
@@ -202,6 +207,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step6-extra", action="append", default=[])
 
     parser.add_argument("--doa-extra", action="append", default=[])
+    parser.add_argument(
+        "--use-button-gt",
+        action="store_true",
+        default=False,
+        help="Enable UDP button ground-truth bridge and plot stream.",
+    )
+    parser.add_argument("--gt-listen-host", default="0.0.0.0")
+    parser.add_argument("--gt-listen-port", type=int, default=5005)
+    parser.add_argument("--gt-user0-id", default="user-0")
+    parser.add_argument("--gt-user1-id", default="user-1")
+    parser.add_argument("--gt-button0-key", default="u0")
+    parser.add_argument("--gt-button1-key", default="u1")
+    parser.add_argument("--gt-poll-hz", type=float, default=20.0)
+    parser.add_argument("--gt-stale-sec", type=float, default=0.7)
 
     parser.add_argument("--max-cnn-staleness-sec", type=float, default=0.8)
     parser.add_argument(
@@ -262,6 +281,8 @@ def _build_step6_cmd(args: argparse.Namespace) -> list[str]:
         "--min-speaker-score",
         str(float(args.min_speaker_score)),
     ]
+    if args.use_button_gt:
+        cmd.extend(["--gt-jsonl-live", args.gt_jsonl_live])
     if args.cnn_source == "furhat":
         cmd.extend(["--furhat-ip", args.furhat_ip])
         if args.furhat_auth:
@@ -280,6 +301,31 @@ def _build_doa_cmd(args: argparse.Namespace) -> list[str]:
     for extra in args.doa_extra:
         cmd.extend(shlex.split(extra))
     return cmd
+
+
+def _build_gt_bridge_cmd(args: argparse.Namespace) -> list[str]:
+    return [
+        args.python_exe,
+        str(PROJECT_ROOT / "audio_doa" / "button_gt_bridge.py"),
+        "--listen-host",
+        str(args.gt_listen_host),
+        "--listen-port",
+        str(int(args.gt_listen_port)),
+        "--output-jsonl",
+        str(args.gt_jsonl_live),
+        "--poll-hz",
+        str(float(args.gt_poll_hz)),
+        "--stale-sec",
+        str(float(args.gt_stale_sec)),
+        "--user0-id",
+        str(args.gt_user0_id),
+        "--user1-id",
+        str(args.gt_user1_id),
+        "--button0-key",
+        str(args.gt_button0_key),
+        "--button1-key",
+        str(args.gt_button1_key),
+    ]
 
 
 def _clip01(value: float) -> float:
@@ -477,17 +523,25 @@ def main() -> None:
 
     cnn_path = Path(args.cnn_jsonl_live)
     doa_path = Path(args.doa_jsonl_live)
+    gt_path = Path(args.gt_jsonl_live)
     cnn_path.parent.mkdir(parents=True, exist_ok=True)
     doa_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.use_button_gt:
+        gt_path.parent.mkdir(parents=True, exist_ok=True)
     if args.truncate_cnn_jsonl:
         cnn_path.write_text("")
     if args.truncate_doa_jsonl:
         doa_path.write_text("")
+    if args.use_button_gt and args.truncate_gt_jsonl:
+        gt_path.write_text("")
 
     step6_cmd = _build_step6_cmd(args)
     doa_cmd = _build_doa_cmd(args)
+    gt_cmd = _build_gt_bridge_cmd(args) if args.use_button_gt else None
     print("[run-live-fusion] step6 cmd:", " ".join(step6_cmd))
     print("[run-live-fusion] doa cmd:", " ".join(doa_cmd))
+    if gt_cmd is not None:
+        print("[run-live-fusion] gt cmd:", " ".join(gt_cmd))
 
     step6_stdout = None if args.show_child_logs else subprocess.DEVNULL
     step6_stderr = None if args.show_child_logs else subprocess.STDOUT
@@ -507,6 +561,16 @@ def main() -> None:
         text=True,
         bufsize=1,
     )
+    gt_proc = None
+    if gt_cmd is not None:
+        gt_proc = subprocess.Popen(
+            gt_cmd,
+            cwd=str(PROJECT_ROOT),
+            stdout=None if args.show_child_logs else subprocess.DEVNULL,
+            stderr=None if args.show_child_logs else subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
 
     live_cnn = LiveCNNSnapshots(str(cnn_path))
     doa_pump = DOAStreamPump(doa_proc, doa_path)
@@ -542,6 +606,10 @@ def main() -> None:
             if doa_proc.poll() is not None:
                 raise RuntimeError(
                     f"doa process exited early with code {doa_proc.returncode}."
+                )
+            if gt_proc is not None and gt_proc.poll() is not None:
+                raise RuntimeError(
+                    f"button_gt_bridge process exited early with code {gt_proc.returncode}."
                 )
 
             now_ts = time.time()
@@ -679,6 +747,7 @@ def main() -> None:
     finally:
         doa_pump.close()
         _terminate_process(doa_proc, "doa_core")
+        _terminate_process(gt_proc, "button_gt_bridge")
         _terminate_process(step6_proc, "step6_realtime_infer")
 
 
