@@ -1,2 +1,3 @@
 pyusb>=1.2.1
+libusb-package>=1.0.26.3; platform_system == "Windows"
 websocket-client>=1.8.0

@@ -70,9 +70,28 @@ class UserBox:
     location_z: float | None = None
 
 
+def _wrap_deg(angle_deg: float) -> float:
+    return ((float(angle_deg) + 180.0) % 360.0) - 180.0
+
+
+def _raw_doa_alignment_score(
+    azimuth_deg: float | None,
+    bearing_deg: float | None,
+    sigma_deg: float | None,
+    min_sigma_deg: float,
+    default_sigma_deg: float,
+) -> float:
+    if azimuth_deg is None or bearing_deg is None:
+        return float("nan")
+    sigma = float(default_sigma_deg) if sigma_deg is None else max(float(min_sigma_deg), float(sigma_deg))
+    delta = abs(_wrap_deg(float(azimuth_deg) - float(bearing_deg)))
+    return float(math.exp(-0.5 * (delta / sigma) ** 2))
+
+
 class ScoreHistory:
-    def __init__(self, max_points: int = 140):
+    def __init__(self, max_points: int = 140, clip_doa_01: bool = True):
         self.max_points = max(20, int(max_points))
+        self.clip_doa_01 = bool(clip_doa_01)
         self._series: dict[str, dict[str, deque]] = {}
         self._palette: list[tuple[int, int, int]] = [
             (59, 85, 255),
@@ -105,14 +124,16 @@ class ScoreHistory:
         return series
 
     @staticmethod
-    def _to_score(value) -> float:
+    def _to_value(value, clip_01: bool) -> float:
         if value is None:
             return float("nan")
         try:
-            score = float(value)
+            value_f = float(value)
         except (TypeError, ValueError):
             return float("nan")
-        return float(np.clip(score, 0.0, 1.0))
+        if clip_01:
+            return float(np.clip(value_f, 0.0, 1.0))
+        return float(value_f)
 
     def update(self, outputs: list[dict], hide_values: bool = False) -> None:
         if hide_values:
@@ -137,9 +158,9 @@ class ScoreHistory:
             if cnn_score is None:
                 cnn_score = out.get("prob")
             frame_values[track_id] = (
-                self._to_score(cnn_score),
-                self._to_score(out.get("fusion_doa")),
-                self._to_score(out.get("fusion_overall")),
+                self._to_value(cnn_score, clip_01=True),
+                self._to_value(out.get("fusion_doa"), clip_01=self.clip_doa_01),
+                self._to_value(out.get("fusion_overall"), clip_01=True),
             )
 
         for track_id, series in self._series.items():
@@ -315,6 +336,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fusion-default-sigma-deg", type=float, default=25.0)
     parser.add_argument("--fusion-min-sigma-deg", type=float, default=8.0)
+    parser.add_argument(
+        "--overall-missing-style",
+        choices=["gap", "zero", "gray"],
+        default="zero",
+        help=(
+            "How to plot Overall score when fusion is unavailable: "
+            "'gap' keeps breaks, 'zero' writes 0.0, 'gray' writes 0.0 and dims panel."
+        ),
+    )
+    parser.add_argument(
+        "--show-raw-doa-debug",
+        action="store_true",
+        help=(
+            "Debug mode: plot raw DOA alignment in charts. "
+            "Default charts use fused/gated DOA scores."
+        ),
+    )
     parser.add_argument(
         "--min-speaker-score",
         type=float,
@@ -516,9 +554,14 @@ def _draw_score_line(
     width: int,
     height: int,
     color: tuple[int, int, int],
+    y_min: float = 0.0,
+    y_max: float = 1.0,
 ) -> None:
     if len(values) < 2 or width <= 1 or height <= 1:
         return
+    span = float(y_max) - float(y_min)
+    if span <= 1e-9:
+        span = 1.0
     segments: list[list[list[int]]] = []
     current: list[list[int]] = []
     denom = max(1, len(values) - 1)
@@ -528,8 +571,10 @@ def _draw_score_line(
                 segments.append(current)
             current = []
             continue
+        clipped = float(np.clip(float(value), float(y_min), float(y_max)))
+        norm = (clipped - float(y_min)) / span
         px = x0 + int(round((i / denom) * (width - 1)))
-        py = y0 + int(round((1.0 - value) * (height - 1)))
+        py = y0 + int(round((1.0 - norm) * (height - 1)))
         current.append([px, py])
     if len(current) >= 2:
         segments.append(current)
@@ -538,12 +583,95 @@ def _draw_score_line(
         cv2.polylines(frame, [pts], False, color, 2, lineType=cv2.LINE_AA)
 
 
+def _draw_doa_compass(
+    board: np.ndarray,
+    hud: dict | None,
+    x: int,
+    y: int,
+    size: int,
+) -> int:
+    panel_w = max(100, int(size))
+    panel_h = panel_w + 24
+    x2 = x + panel_w
+    y2 = y + panel_h
+    cv2.rectangle(board, (x, y), (x2, y2), (38, 38, 38), 1)
+    cv2.putText(
+        board,
+        "DOA Compass",
+        (x + 8, y + 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (220, 220, 220),
+        1,
+        lineType=cv2.LINE_AA,
+    )
+
+    cx = x + panel_w // 2
+    cy = y + 24 + panel_w // 2
+    radius = max(18, panel_w // 2 - 10)
+    cv2.circle(board, (cx, cy), radius, (70, 70, 70), 1, lineType=cv2.LINE_AA)
+    cv2.line(board, (cx - radius, cy), (cx + radius, cy), (55, 55, 55), 1, lineType=cv2.LINE_AA)
+    cv2.line(board, (cx, cy - radius), (cx, cy + radius), (55, 55, 55), 1, lineType=cv2.LINE_AA)
+
+    cv2.putText(board, "B", (cx - 4, cy - radius - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+    cv2.putText(board, "R", (cx + radius + 4, cy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+    cv2.putText(board, "L", (cx - radius - 12, cy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+    cv2.putText(board, "F", (cx - 4, cy + radius + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+
+    doa_angle = None
+    speech_active = False
+    if isinstance(hud, dict):
+        speech_active = bool(hud.get("speech_active"))
+        doa_info = hud.get("doa")
+        if isinstance(doa_info, dict):
+            doa_angle = doa_info.get("azimuth_raw_deg")
+            if doa_angle is None:
+                doa_angle = doa_info.get("raw_azimuth_deg")
+            if doa_angle is None:
+                doa_angle = doa_info.get("azimuth_deg")
+
+    if doa_angle is None:
+        cv2.putText(
+            board,
+            "angle: --",
+            (x + 8, y2 - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (150, 150, 150),
+            1,
+            lineType=cv2.LINE_AA,
+        )
+        return panel_h
+
+    angle = float(doa_angle)
+    rad = math.radians(angle)
+    end = (
+        int(round(cx + radius * math.sin(rad))),
+        int(round(cy + radius * math.cos(rad))),
+    )
+    needle_color = (0, 255, 0) if speech_active else (140, 140, 140)
+    cv2.arrowedLine(board, (cx, cy), end, needle_color, 2, cv2.LINE_AA, 0, 0.25)
+    cv2.circle(board, end, 3, needle_color, -1, lineType=cv2.LINE_AA)
+    cv2.putText(
+        board,
+        f"angle: {angle:+.1f} deg",
+        (x + 8, y2 - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        needle_color,
+        1,
+        lineType=cv2.LINE_AA,
+    )
+    return panel_h
+
+
 def render_score_board(
     outputs: list[dict],
     hud: dict | None,
     score_history: ScoreHistory,
     width: int = 980,
     height: int = 700,
+    metrics: list[tuple[str, str, float, float]] | None = None,
 ) -> np.ndarray:
     board = np.full((height, width, 3), 16, dtype=np.uint8)
     mode = "UNKNOWN" if hud is None else str(hud.get("mode", "UNKNOWN"))
@@ -576,6 +704,8 @@ def render_score_board(
 
     legend_y = 60
     legend_x = 16
+    compass_size = min(170, max(110, int(height * 0.19)))
+    legend_right_limit = width - compass_size - 36
     for user_id in user_ids:
         color = score_history.get_color(user_id)
         cv2.rectangle(board, (legend_x, legend_y), (legend_x + 14, legend_y + 14), color, -1)
@@ -590,19 +720,28 @@ def render_score_board(
             lineType=cv2.LINE_AA,
         )
         legend_x += 125
-        if legend_x > (width - 140):
+        if legend_x > legend_right_limit:
             legend_x = 16
             legend_y += 20
 
-    header_h = legend_y + 24
-    metrics = [("CNN Score", "cnn"), ("DOA Score", "doa"), ("Overall Score", "overall")]
+    compass_x = width - compass_size - 16
+    compass_y = 8
+    compass_h = _draw_doa_compass(board, hud, compass_x, compass_y, compass_size)
+
+    header_h = max(legend_y + 24, compass_y + compass_h + 8)
+    if metrics is None:
+        metrics = [
+            ("CNN Score", "cnn", 0.0, 1.0),
+            ("DOA Score", "doa", 0.0, 1.0),
+            ("Overall Score", "overall", 0.0, 1.0),
+        ]
     pad = 16
     section_gap = 12
     usable_h = height - header_h - pad
     section_h = max(110, (usable_h - section_gap * (len(metrics) - 1)) // len(metrics))
     section_w = width - 2 * pad
 
-    for idx, (title, key) in enumerate(metrics):
+    for idx, (title, key, y_min, y_max) in enumerate(metrics):
         y1 = header_h + idx * (section_h + section_gap)
         y2 = y1 + section_h
         x1 = pad
@@ -626,9 +765,10 @@ def render_score_board(
         cv2.rectangle(board, (plot_x, plot_y), (plot_x + plot_w, plot_y + plot_h), (70, 70, 70), 1)
         mid_y = plot_y + plot_h // 2
         cv2.line(board, (plot_x, mid_y), (plot_x + plot_w, mid_y), (55, 55, 55), 1)
-        cv2.putText(board, "1.0", (x1 + 8, plot_y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
-        cv2.putText(board, "0.5", (x1 + 8, mid_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
-        cv2.putText(board, "0.0", (x1 + 8, plot_y + plot_h), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+        y_mid = 0.5 * (float(y_min) + float(y_max))
+        cv2.putText(board, f"{float(y_max):.1f}", (x1 + 8, plot_y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+        cv2.putText(board, f"{y_mid:.1f}", (x1 + 8, mid_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+        cv2.putText(board, f"{float(y_min):.1f}", (x1 + 8, plot_y + plot_h), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
 
         for user_id in user_ids:
             series = score_history.get(user_id)
@@ -642,6 +782,157 @@ def render_score_board(
                 plot_w,
                 plot_h,
                 score_history.get_color(user_id),
+                y_min=float(y_min),
+                y_max=float(y_max),
+            )
+
+    return board
+
+
+def render_unified_dashboard(
+    frame: np.ndarray,
+    outputs: list[dict],
+    hud: dict | None,
+    score_history: ScoreHistory,
+    camera_width: int,
+    camera_height: int,
+    metrics: list[tuple[str, str, float, float]] | None = None,
+    overall_missing_style: str = "gap",
+    overall_inactive: bool = False,
+) -> np.ndarray:
+    cam_w = max(320, int(camera_width))
+    cam_h = max(240, int(camera_height))
+    camera_panel = cv2.resize(frame, (cam_w, cam_h), interpolation=cv2.INTER_LINEAR)
+
+    side_w = max(180, int(cam_w * 0.28))
+    top_h = cam_h
+    plot_area_h = max(330, int(cam_h * 0.95))
+    pad = 16
+
+    board_w = pad * 3 + cam_w + side_w
+    board_h = pad * 3 + top_h + plot_area_h
+    board = np.full((board_h, board_w, 3), 16, dtype=np.uint8)
+
+    cam_x = pad
+    cam_y = pad
+    board[cam_y : cam_y + cam_h, cam_x : cam_x + cam_w] = camera_panel
+    cv2.rectangle(board, (cam_x, cam_y), (cam_x + cam_w, cam_y + cam_h), (38, 38, 38), 1)
+
+    side_x = cam_x + cam_w + pad
+    side_y = pad
+    cv2.rectangle(board, (side_x, side_y), (side_x + side_w, side_y + top_h), (30, 30, 30), 1)
+
+    compass_margin = 10
+    compass_size = min(
+        side_w - 2 * compass_margin,
+        top_h - 2 * compass_margin - 24,
+    )
+    compass_size = max(110, compass_size)
+    compass_x = side_x + (side_w - compass_size) // 2
+    compass_y = side_y + compass_margin
+    compass_h = _draw_doa_compass(board, hud, compass_x, compass_y, compass_size)
+
+    user_ids: list[str] = []
+    for out in outputs:
+        user_id = str(out.get("track_id"))
+        if user_id and user_id not in user_ids:
+            user_ids.append(user_id)
+    for user_id, _series in score_history.items():
+        if user_id not in user_ids:
+            user_ids.append(user_id)
+    user_ids = user_ids[:8]
+
+    legend_x = side_x + 10
+    legend_y = compass_y + compass_h + 10
+    legend_bottom = side_y + top_h - 8
+    for user_id in user_ids:
+        if legend_y + 14 > legend_bottom:
+            break
+        color = score_history.get_color(user_id)
+        cv2.rectangle(board, (legend_x, legend_y), (legend_x + 14, legend_y + 14), color, -1)
+        cv2.putText(
+            board,
+            user_id,
+            (legend_x + 20, legend_y + 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.44,
+            (235, 235, 235),
+            1,
+            lineType=cv2.LINE_AA,
+        )
+        legend_y += 20
+
+    if metrics is None:
+        metrics = [
+            ("CNN Score", "cnn", 0.0, 1.0),
+            ("DOA Score", "doa", 0.0, 1.0),
+            ("Overall Score", "overall", 0.0, 1.0),
+        ]
+
+    plot_area_x = pad
+    plot_area_y = pad * 2 + top_h
+    plot_area_w = board_w - 2 * pad
+    section_gap = 12
+    section_h = max(90, (plot_area_h - section_gap * (len(metrics) - 1)) // len(metrics))
+
+    for idx, (title, key, y_min, y_max) in enumerate(metrics):
+        y1 = plot_area_y + idx * (section_h + section_gap)
+        y2 = min(y1 + section_h, board_h - pad)
+        x1 = plot_area_x
+        x2 = plot_area_x + plot_area_w
+        cv2.rectangle(board, (x1, y1), (x2, y2), (38, 38, 38), 1)
+        cv2.putText(
+            board,
+            title,
+            (x1 + 8, y1 + 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (220, 220, 220),
+            1,
+            lineType=cv2.LINE_AA,
+        )
+
+        plot_x = x1 + 52
+        plot_y = y1 + 26
+        plot_w = max(120, plot_area_w - 64)
+        plot_h = max(45, (y2 - y1) - 36)
+        cv2.rectangle(board, (plot_x, plot_y), (plot_x + plot_w, plot_y + plot_h), (70, 70, 70), 1)
+        mid_y = plot_y + plot_h // 2
+        cv2.line(board, (plot_x, mid_y), (plot_x + plot_w, mid_y), (55, 55, 55), 1)
+        y_mid = 0.5 * (float(y_min) + float(y_max))
+        cv2.putText(board, f"{float(y_max):.1f}", (x1 + 8, plot_y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+        cv2.putText(board, f"{y_mid:.1f}", (x1 + 8, mid_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+        cv2.putText(board, f"{float(y_min):.1f}", (x1 + 8, plot_y + plot_h), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, lineType=cv2.LINE_AA)
+
+        for user_id in user_ids:
+            series = score_history.get(user_id)
+            if not series:
+                continue
+            _draw_score_line(
+                board,
+                list(series[key]),
+                plot_x,
+                plot_y,
+                plot_w,
+                plot_h,
+                score_history.get_color(user_id),
+                y_min=float(y_min),
+                y_max=float(y_max),
+            )
+
+        if key == "overall" and overall_missing_style == "gray" and overall_inactive:
+            overlay = board[y1:y2, x1:x2].copy()
+            cv2.rectangle(overlay, (0, 0), (x2 - x1, y2 - y1), (95, 95, 95), -1)
+            cv2.addWeighted(overlay, 0.18, board[y1:y2, x1:x2], 0.82, 0, board[y1:y2, x1:x2])
+            cv2.putText(
+                board,
+                "Fusion unavailable",
+                (x1 + 12, y1 + 38),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (190, 190, 190),
+                1,
+                lineType=cv2.LINE_AA,
             )
 
     return board
@@ -881,6 +1172,11 @@ class FusionOverlayRuntime:
 
     def annotate_outputs(self, outputs: list[dict], t_value: float) -> dict:
         doa_obs = self.live_doa.get_for_time(t_value=t_value, max_staleness_sec=self.max_staleness_sec)
+        doa_raw = None
+        if doa_obs is not None:
+            doa_raw = doa_obs.get("azimuth_raw_deg")
+            if doa_raw is None:
+                doa_raw = doa_obs.get("raw_azimuth_deg")
         hud = {
             "mode": "NO_SPEECH" if doa_obs is None else "SPEECH_AV",
             "speech_active": False if doa_obs is None else bool(doa_obs.get("speech_active") or doa_obs.get("speech_detected")),
@@ -889,6 +1185,8 @@ class FusionOverlayRuntime:
             "speaker_score": None,
             "weights": {"cnn": 1.0, "doa": 0.0},
             "doa": {
+                "raw_azimuth_deg": None if doa_obs is None else doa_obs.get("raw_azimuth_deg"),
+                "azimuth_raw_deg": doa_raw,
                 "azimuth_deg": None if doa_obs is None else doa_obs.get("azimuth_deg"),
                 "conf_doa_srp": None if doa_obs is None else doa_obs.get("conf_doa_srp"),
                 "audio_conf": None if doa_obs is None else doa_obs.get("audio_conf"),
@@ -961,7 +1259,11 @@ class FusionOverlayRuntime:
         hud["speaker_id"] = active_id
         hud["speaker_score"] = raw_speaker_score
         hud["weights"] = result.get("weights", hud["weights"])
-        hud["doa"] = result.get("doa", hud["doa"])
+        doa_payload = result.get("doa")
+        if isinstance(doa_payload, dict):
+            merged_doa = dict(hud["doa"])
+            merged_doa.update(doa_payload)
+            hud["doa"] = merged_doa
         score_map = {str(item["user_id"]): item for item in result.get("per_user", [])}
         for out in outputs:
             row = score_map.get(str(out["track_id"]))
@@ -996,6 +1298,7 @@ def process_frame(
     cnn_jsonl_handle=None,
     fusion_runtime: FusionOverlayRuntime | None = None,
     score_history: ScoreHistory | None = None,
+    raw_score_history: ScoreHistory | None = None,
 ) -> bool:
     now = time.time()
     if not limiter.should_process(now):
@@ -1047,91 +1350,132 @@ def process_frame(
             if args.show and int(now) != print_state["last_print"]:
                 print_state["last_print"] = int(now)
                 print("no users")
-            if args.show:
-                cv2.imshow("vvad_realtime", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    return False
-            return True
-        frame_h, frame_w = frame.shape[:2]
-        for user in user_boxes:
-            x1, y1, x2, y2 = expand_bbox(
-                user.x, user.y, user.w, user.h, args.bbox_padding
-            )
-            bbox = clamp_bbox(x1, y1, x2, y2, frame_w, frame_h)
-            if bbox is None:
-                continue
-            x1i, y1i, x2i, y2i = bbox
-            crop = frame[y1i:y2i, x1i:x2i]
-            if crop.size == 0:
-                continue
-            if args.upsample_small_faces:
-                crop = maybe_upsample_crop(
-                    crop,
-                    x2i - x1i,
-                    y2i - y1i,
-                    frame_w,
-                    frame_h,
-                    args,
+        else:
+            frame_h, frame_w = frame.shape[:2]
+            for user in user_boxes:
+                x1, y1, x2, y2 = expand_bbox(
+                    user.x, user.y, user.w, user.h, args.bbox_padding
                 )
-            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            crop_image = image_module.Image(
-                image_module.ImageFormat.SRGB, np.ascontiguousarray(crop_rgb)
-            )
-            result = landmarker.detect(crop_image)
-            faces = result.face_landmarks or []
-            if not faces:
-                continue
-            face_landmarks = faces[0]
-            if args.draw_landmarks:
-                draw_landmark_points_offset(
-                    frame,
+                bbox = clamp_bbox(x1, y1, x2, y2, frame_w, frame_h)
+                if bbox is None:
+                    continue
+                x1i, y1i, x2i, y2i = bbox
+                crop = frame[y1i:y2i, x1i:x2i]
+                if crop.size == 0:
+                    continue
+                if args.upsample_small_faces:
+                    crop = maybe_upsample_crop(
+                        crop,
+                        x2i - x1i,
+                        y2i - y1i,
+                        frame_w,
+                        frame_h,
+                        args,
+                    )
+                crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                crop_image = image_module.Image(
+                    image_module.ImageFormat.SRGB, np.ascontiguousarray(crop_rgb)
+                )
+                result = landmarker.detect(crop_image)
+                faces = result.face_landmarks or []
+                if not faces:
+                    continue
+                face_landmarks = faces[0]
+                if args.draw_landmarks:
+                    draw_landmark_points_offset(
+                        frame,
+                        face_landmarks,
+                        spec.indices,
+                        x1i,
+                        y1i,
+                        x2i - x1i,
+                        y2i - y1i,
+                        color=(0, 255, 0),
+                    )
+                features = extract_features(
                     face_landmarks,
                     spec.indices,
-                    x1i,
-                    y1i,
-                    x2i - x1i,
-                    y2i - y1i,
-                    color=(0, 255, 0),
+                    oval_indices,
+                    spec.feature_type,
+                    args.min_oval_size,
+                    args.max_oval_size,
+                    args.edge_margin,
                 )
-            features = extract_features(
-                face_landmarks,
-                spec.indices,
-                oval_indices,
-                spec.feature_type,
-                args.min_oval_size,
-                args.max_oval_size,
-                args.edge_margin,
-            )
-            if features is None:
-                continue
-            outputs.extend(
-                update_track_state(
-                    user.user_id,
-                    features,
-                    states,
-                    spec,
-                    model,
-                    device,
-                    args,
-                    speak_on,
-                    speak_off,
-                    (x1i, y1i, x2i, y2i),
-                    estimate_user_bearing_deg(
-                        user,
+                if features is None:
+                    continue
+                outputs.extend(
+                    update_track_state(
+                        user.user_id,
+                        features,
+                        states,
+                        spec,
+                        model,
+                        device,
+                        args,
+                        speak_on,
+                        speak_off,
                         (x1i, y1i, x2i, y2i),
-                        frame_w,
-                        args.camera_hfov_deg,
-                        args.flip_cnn_bearing,
-                    ),
+                        estimate_user_bearing_deg(
+                            user,
+                            (x1i, y1i, x2i, y2i),
+                            frame_w,
+                            args.camera_hfov_deg,
+                            args.flip_cnn_bearing,
+                        ),
+                    )
                 )
-            )
 
     hud = None
     if fusion_runtime is not None:
         hud = fusion_runtime.annotate_outputs(outputs, now)
+    doa_azimuth_raw = None
+    doa_sigma = None
+    if isinstance(hud, dict):
+        doa_info = hud.get("doa")
+        if isinstance(doa_info, dict):
+            doa_azimuth_raw = doa_info.get("azimuth_raw_deg")
+            if doa_azimuth_raw is None:
+                doa_azimuth_raw = doa_info.get("raw_azimuth_deg")
+            if doa_azimuth_raw is None:
+                doa_azimuth_raw = doa_info.get("azimuth_deg")
+            doa_sigma = doa_info.get("sigma_deg")
+
+    # Dashboard semantics:
+    # - CNN: ungated model probability
+    # - DOA: ungated geometric alignment
+    # - Overall: gated fusion score
+    chart_outputs: list[dict] = []
+    overall_inactive = True
+    for out in outputs:
+        track_id = str(out.get("track_id"))
+        if not track_id:
+            continue
+        overall_value = out.get("fusion_overall")
+        if overall_value is not None:
+            overall_inactive = False
+        elif args.overall_missing_style in ("zero", "gray"):
+            overall_value = 0.0
+        chart_outputs.append(
+            {
+                "track_id": track_id,
+                "fusion_cnn": out.get("prob"),
+                "fusion_doa": _raw_doa_alignment_score(
+                    azimuth_deg=None if doa_azimuth_raw is None else float(doa_azimuth_raw),
+                    bearing_deg=None if out.get("bearing_deg") is None else float(out.get("bearing_deg")),
+                    sigma_deg=None if doa_sigma is None else float(doa_sigma),
+                    min_sigma_deg=float(args.fusion_min_sigma_deg),
+                    default_sigma_deg=float(args.fusion_default_sigma_deg),
+                ),
+                "fusion_overall": overall_value,
+            }
+        )
+
     if score_history is not None:
-        hide_values = bool(hud and str(hud.get("mode", "")) == "NO_SPEECH")
-        score_history.update(outputs, hide_values=hide_values)
+        # Keep CNN/DOA plots ungated (always show raw values). Overall remains
+        # gated because chart_outputs carries fusion_overall=None when invalid.
+        score_history.update(chart_outputs, hide_values=False)
+    if raw_score_history is not None:
+        raw_score_history.update(chart_outputs, hide_values=False)
 
     if outputs:
         for out in outputs:
@@ -1152,10 +1496,29 @@ def process_frame(
 
     if args.show:
         draw_overlays(frame, outputs, hud)
-        cv2.imshow("vvad_realtime", frame)
-        if score_history is not None:
-            score_board = render_score_board(outputs, hud, score_history)
-            cv2.imshow("vvad_scores", score_board)
+        metrics = [
+            ("CNN Score", "cnn", 0.0, 1.0),
+            ("DOA Score", "doa", 0.0, 1.0),
+            ("Overall Score", "overall", 0.0, 1.0),
+        ]
+        active_history = score_history
+        if args.show_raw_doa_debug and raw_score_history is not None:
+            active_history = raw_score_history
+        if active_history is not None:
+            dashboard = render_unified_dashboard(
+                frame,
+                outputs,
+                hud,
+                active_history,
+                camera_width=max(320, int(args.window_width)),
+                camera_height=max(240, int(args.window_height)),
+                metrics=metrics,
+                overall_missing_style=str(args.overall_missing_style),
+                overall_inactive=overall_inactive,
+            )
+        else:
+            dashboard = frame
+        cv2.imshow("vvad_dashboard", dashboard)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             return False
     return True
@@ -1229,6 +1592,7 @@ async def run_furhat_stream(
     cnn_jsonl_handle=None,
     fusion_runtime: FusionOverlayRuntime | None = None,
     score_history: ScoreHistory | None = None,
+    raw_score_history: ScoreHistory | None = None,
 ) -> None:
     try:
         from furhat_realtime_api import AsyncFurhatClient, Events
@@ -1334,6 +1698,7 @@ async def run_furhat_stream(
                 cnn_jsonl_handle,
                 fusion_runtime,
                 score_history,
+                raw_score_history,
             )
             if not keep_running:
                 break
@@ -1392,18 +1757,15 @@ def main() -> None:
     if args.doa_jsonl_live:
         fusion_runtime = FusionOverlayRuntime(args)
     score_history = ScoreHistory() if args.show else None
+    raw_score_history = (
+        ScoreHistory() if (args.show and args.show_raw_doa_debug) else None
+    )
     if args.show:
-        cv2.namedWindow("vvad_realtime", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("vvad_dashboard", cv2.WINDOW_NORMAL)
         cv2.resizeWindow(
-            "vvad_realtime",
-            max(320, int(args.window_width)),
-            max(240, int(args.window_height)),
-        )
-        cv2.namedWindow("vvad_scores", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(
-            "vvad_scores",
-            max(700, int(args.window_width)),
-            max(520, int(args.window_height)),
+            "vvad_dashboard",
+            max(900, int(args.window_width) + 260),
+            max(700, int(args.window_height) + 360),
         )
     cnn_jsonl_handle = None
     if args.emit_cnn_jsonl:
@@ -1424,6 +1786,7 @@ def main() -> None:
                         cnn_jsonl_handle,
                         fusion_runtime,
                         score_history,
+                        raw_score_history,
                     )
                 )
             else:
@@ -1461,6 +1824,7 @@ def main() -> None:
                         cnn_jsonl_handle,
                         fusion_runtime,
                         score_history,
+                        raw_score_history,
                     ):
                         break
                 cap.release()

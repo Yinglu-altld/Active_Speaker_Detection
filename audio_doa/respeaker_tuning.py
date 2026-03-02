@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 try:
     import usb.core
+    import usb.backend.libusb1
     import usb.util
 except ImportError:  # pragma: no cover
     usb = None
@@ -29,6 +30,30 @@ def _require_pyusb() -> None:
             "Install: pip install pyusb\n"
             "You may also need libusb (e.g. macOS: `brew install libusb`)."
         )
+
+
+def _resolve_backend():
+    if usb is None:
+        return None
+
+    try:
+        backend = usb.backend.libusb1.get_backend()
+        if backend is not None:
+            return backend
+    except Exception:
+        pass
+
+    # Windows fallback: this package ships libusb DLLs for PyUSB.
+    try:
+        import libusb_package  # type: ignore
+
+        backend = libusb_package.get_libusb1_backend()
+        if backend is not None:
+            return backend
+    except Exception:
+        pass
+
+    return None
 
 
 @dataclass(frozen=True)
@@ -66,13 +91,23 @@ class RespeakerTuning:
     @staticmethod
     def find(ids: RespeakerIds = RespeakerIds()):
         _require_pyusb()
+        backend = _resolve_backend()
+        if backend is None:
+            raise RuntimeError(
+                "No USB backend available for pyusb.\n"
+                "Install libusb runtime:\n"
+                "- Windows: pip install libusb-package (and use WinUSB driver for ReSpeaker)\n"
+                "- macOS: brew install libusb\n"
+                "- Linux: install libusb-1.0 package"
+            )
+
         vendor = int(ids.vendor_id)
         product = int(ids.product_id)
-        dev = usb.core.find(idVendor=vendor, idProduct=product)
+        dev = usb.core.find(idVendor=vendor, idProduct=product, backend=backend)
         if dev is None:
             # Some backends/environments fail filtered search while find_all still lists devices.
             # Fallback to manual matching for robustness.
-            for item in usb.core.find(find_all=True) or []:
+            for item in usb.core.find(find_all=True, backend=backend) or []:
                 try:
                     if int(item.idVendor) == vendor and int(item.idProduct) == product:
                         dev = item
@@ -81,7 +116,7 @@ class RespeakerTuning:
                     continue
         if dev is None:
             found = []
-            for item in usb.core.find(find_all=True) or []:
+            for item in usb.core.find(find_all=True, backend=backend) or []:
                 try:
                     found.append((int(item.idVendor), int(item.idProduct)))
                 except Exception:

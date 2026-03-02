@@ -35,11 +35,8 @@ Current realtime inference expects:
 ## 3. Run Full Live Fusion (Recommended)
 
 ```bash
-./venv/bin/python audio_doa/run_live_fusion.py \
-  --furhat-ip 192.168.1.109 \
-  --show-child-logs \
-  --step6-extra "--show --window-width 960 --window-height 540" \
-  --doa-extra "--emit-idle --poll-hz 20"
+.\venv\Scripts\python.exe audio_doa\run_live_fusion.py --furhat-ip 192.168.1.108 --show-child-logs --step6-extra "--show --window-width 960 --window-height 540" --doa-extra "--emit-idle --poll-hz 20"
+
 ```
 
 What this starts internally:

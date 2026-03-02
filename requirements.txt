@@ -3,3 +3,4 @@ pandas
 opencv-python
 mediapipe
 furhat-realtime-api
+torch
