@@ -106,6 +106,17 @@ Send UDP JSON to host/port configured in `run_live_fusion.py` (default `5005`):
 - `u0` usually maps to D2 button, `u1` to D6 button.
 - `1` = pressed, `0` = released.
 
+Arduino IDE sketch is included at:
+
+- `hardware/nodemcu_buttons/nodemcu_buttons.ino`
+
+Before uploading, set these constants in the sketch:
+
+- `WIFI_SSID`
+- `WIFI_PASSWORD`
+- `DEST_IP` (your laptop IP running fusion)
+- `DEST_PORT` (must match `--gt-listen-port`, default `5005`)
+
 ---
 
 ## 6) UI windows

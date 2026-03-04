@@ -132,6 +132,17 @@ Send UDP JSON to the configured host/port:
 - `u1`: button 1 pressed state
 - pressed=`1`, released=`0`
 
+Arduino IDE sketch:
+
+- `../hardware/nodemcu_buttons/nodemcu_buttons.ino`
+
+Set sketch constants before upload:
+
+- `WIFI_SSID`
+- `WIFI_PASSWORD`
+- `DEST_IP`
+- `DEST_PORT`
+
 ---
 
 ## Invalid legacy flags (do not use)
